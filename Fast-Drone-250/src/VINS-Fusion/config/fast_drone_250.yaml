@@ -1,0 +1,139 @@
+%YAML:1.0
+
+#common parameters
+#support: 1 imu 1 cam; 1 imu 2 cam: 2 cam; 
+imu: 1         
+num_of_cam: 2
+
+
+imu_topic: "/mavros/imu/data_raw"
+image0_topic: "/camera/infra1/image_rect_raw"
+image1_topic: "/camera/infra2/image_rect_raw"
+
+
+
+
+output_path: "/home/wj/vins_output"
+
+
+cam0_calib: "left.yaml"
+cam1_calib: "right.yaml"
+image_width: 640
+image_height: 480
+   
+
+# Extrinsic parameter between IMU and Camera.
+estimate_extrinsic: 1   # 0  Have an accurate extrinsic parameters. We will trust the following imu^R_cam, imu^T_cam, don't change it.
+                        # 1  Have an initial guess about extrinsic parameters. We will optimize around your initial guess.
+
+body_T_cam0: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: d
+   data: [ -0.00321371, -0.01084353,  0.99993604,  5.0565592201665305e-02,
+           -0.99996254,  0.00807174, -0.00312626, 2.1124785844035578e-02,
+           -0.00803732, -0.99990863, -0.01086906,  3.9024775279465504e-02,
+            0.0,         0.0,         0.0,         1.0 ]
+
+body_T_cam1: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: d
+   data: [ -0.00321371, -0.01084353,  0.99993604, 5.0114710469528974e-02,
+           -0.99996254,  0.00807174, -0.00312626, -2.9537884753658383e-02,
+           -0.00803732, -0.99990863, -0.01086906, 3.8897111872464522e-02,
+            0.0,         0.0,         0.0,         1.0 ]
+
+
+
+
+# body_T_cam0: !!opencv-matrix
+#    rows: 4
+#    cols: 4
+#    dt: d
+#    data: [ 5.4259564678456274e-02, -2.1193491665982661e-01,
+#        9.7577635282952857e-01, 6.1088153910496712e-02,
+#        -9.9851326059223866e-01, -6.4152484510247021e-03,
+#        5.4130518275439868e-02, 4.2423847554686707e-02,
+#        -5.2122991434224138e-03, -9.7726272603005993e-01,
+#        -2.1196791325560449e-01, -1.2298951441870995e-01, 0., 0., 0., 1. ]
+# body_T_cam1: !!opencv-matrix
+#    rows: 4
+#    cols: 4
+#    dt: d
+#    data: [ 5.6915812882892158e-02, -2.1085706024334400e-01,
+#        9.7585854015293350e-01, 6.5179907187475128e-02,
+#        -9.9836504821304783e-01, -6.8564878477639368e-03,
+#        5.6746974200852049e-02, -5.0802504669366262e-03,
+#        -5.2745379360014007e-03, -9.7749285865418389e-01,
+#        -2.1090256169528465e-01, -1.2293603224765860e-01, 0., 0., 0., 1. ]
+
+
+
+#Multiple thread support
+multiple_thread: 1
+
+#feature traker paprameters
+max_cnt: 150            # max feature number in feature tracking
+min_dist: 30            # min distance between two features 
+freq: 10                # frequence (Hz) of publish tracking result. At least 10Hz for good estimation. If set 0, the frequence will be same as raw image 
+F_threshold: 1.0        # ransac threshold (pixel)
+show_track: 1           # publish tracking image as topic
+flow_back: 1            # perform forward and backward optical flow to improve feature tracking accuracy
+
+#frontend degradation handling
+frontend_adaptive_feature: 1
+frontend_gradient_points: 1
+frontend_low_quality: 0.006
+frontend_min_quality: 0.002
+frontend_degraded_min_dist_ratio: 0.6
+frontend_gradient_grid: 32
+frontend_gradient_min: 0.000001
+
+#visual degradation / blind inertial MAP parameters
+blind_enable: 1
+blind_enter_track_num: 8          # enter BLIND if tracked features fall below this
+blind_exit_track_num: 45          # leave BLIND only after enough tracks recover
+blind_degraded_track_num: 25      # DEGRADED below this; visual residuals are down-weighted
+blind_parallax_threshold: 1.0     # px; low parallax keeps the frontend in DEGRADED
+blind_visual_weight_degraded: 0.7
+
+#blind bias anchor.  Start conservative and tune from Allan/bag residuals.
+blind_bias_acc_sigma: 0.03        # m/s^2
+blind_bias_gyr_sigma: 0.002       # rad/s
+blind_bias_relax_rate: 0.25       # per second; larger means trust the lock-in bias less over time
+
+#low-dynamic gravity/ZUPT priors.  These only trigger when IMU looks ground-static.
+blind_tilt_weight: 1.0
+blind_tilt_max_acc_dev: 0.8       # |mean(acc)| must be within this of g
+blind_tilt_max_gyr: 0.08          # rad/s, reserved for low-dynamic gating
+blind_zupt_weight: 2.0
+blind_zupt_max_acc_var: 0.05
+blind_zupt_max_gyr: 0.03
+
+#thrust dynamics from px4ctrl /mavros/setpoint_raw/attitude thrust.
+blind_thrust_weight: 1.0
+blind_thrust_hover_acc: 9.805
+blind_thrust_hover_throttle: 0.35
+blind_thrust_min_dt: 0.02
+
+#optimization parameters
+max_solver_time: 0.04  # max solver itration time (ms), to guarantee real time
+max_num_iterations: 8   # max solver itrations, to guarantee real time
+keyframe_parallax: 10.0 # keyframe selection threshold (pixel)
+
+#imu parameters       The more accurate parameters you provide, the better performance
+acc_n: 0.1          # accelerometer measurement noise standard deviation. #0.2   0.04
+gyr_n: 0.01         # gyroscope measurement noise standard deviation.     #0.05  0.004
+acc_w: 0.001         # accelerometer bias random work noise standard deviation.  #0.002
+gyr_w: 0.0001       # gyroscope bias random work noise standard deviation.     #4.0e-5
+g_norm: 9.805         # gravity magnitude
+
+#unsynchronization parameters
+estimate_td: 1                      # online estimate time offset between camera and imu
+td: -0.05                             # initial value of time offset. unit: s. readed image clock + td = real image clock (IMU clock)
+
+#loop closure parameters
+load_previous_pose_graph: 0        # load and reuse previous pose graph; load from 'pose_graph_save_path'
+pose_graph_save_path: "/home/fast/savedfiles/output/pose_graph/" # save and load path
+save_image: 1                   # save image in pose graph for visualization prupose; you can close this function by setting 0 
