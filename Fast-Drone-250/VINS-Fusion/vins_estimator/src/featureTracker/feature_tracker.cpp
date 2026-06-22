@@ -11,6 +11,92 @@
 
 #include "feature_tracker.h"
 #include <algorithm>
+#include <fstream>   // ===== FEATURE LOGGING (added) =====
+#include <cstring>   // ===== FEATURE LOGGING (added) =====
+
+// ===================== FEATURE LOGGING (added for distribution analysis) =====================
+// 输出每帧"最终送进后端的"左相机特征点 (经过 光流 + 前后向 + setMask + 补点 之后).
+//   1) CSV : 每点一行  t,id,u,v,track_cnt   -> 事后用 Python 画 数量/空间分布/寿命
+//   2) 终端: 每 N 帧打印一次网格热力, 实时粗看空间分布是否病态
+// 不改动任何原有跟踪逻辑, 纯旁路记录.
+namespace
+{
+const char *FEAT_LOG_CSV     = "/tmp/vins_feature_points.csv"; // 输出路径, 按需改
+const int   FEAT_GRID_R      = 6;   // 网格行数
+const int   FEAT_GRID_C      = 8;   // 网格列数
+const int   FEAT_PRINT_EVERY = 10;  // 每多少帧在终端打印一次网格 (CSV 每帧都写)
+
+void logFeatureStats(double t,
+                     const std::vector<cv::Point2f> &pts,
+                     const std::vector<int> &ids,
+                     const std::vector<int> &track_cnt,
+                     int row, int col)
+{
+    // ---- CSV: 每个点一行 ----
+    static std::ofstream fout;
+    static bool inited = false;
+    if (!inited)
+    {
+        fout.open(FEAT_LOG_CSV, std::ios::out | std::ios::trunc);
+        if (fout.is_open())
+            fout << "t,id,u,v,track_cnt\n";
+        else
+            printf("[FT][WARN] cannot open %s for logging\n", FEAT_LOG_CSV);
+        inited = true;
+    }
+    if (fout.is_open())
+    {
+        fout.setf(std::ios::fixed);
+        for (size_t i = 0; i < pts.size() && i < ids.size() && i < track_cnt.size(); i++)
+            fout << t << "," << ids[i] << ","
+                 << pts[i].x << "," << pts[i].y << ","
+                 << track_cnt[i] << "\n";
+        fout.flush();
+    }
+
+    // ---- 终端网格热力 ----
+    if (row <= 0 || col <= 0)
+        return;
+
+    int grid[FEAT_GRID_R][FEAT_GRID_C];
+    memset(grid, 0, sizeof(grid));
+    int cell_h = std::max(1, row / FEAT_GRID_R);
+    int cell_w = std::max(1, col / FEAT_GRID_C);
+    for (const auto &p : pts)
+    {
+        int gr = std::min((int)(p.y / cell_h), FEAT_GRID_R - 1);
+        int gc = std::min((int)(p.x / cell_w), FEAT_GRID_C - 1);
+        if (gr < 0 || gc < 0)
+            continue;
+        grid[gr][gc]++;
+    }
+    int empty_cells = 0, max_cell = 0;
+    for (int r = 0; r < FEAT_GRID_R; r++)
+        for (int c = 0; c < FEAT_GRID_C; c++)
+        {
+            if (grid[r][c] == 0)
+                empty_cells++;
+            max_cell = std::max(max_cell, grid[r][c]);
+        }
+
+    static int frame_cnt = 0;
+    frame_cnt++;
+    if (frame_cnt % FEAT_PRINT_EVERY == 0)
+    {
+        // total / 空格子数(越大分布越差) / 最满格子点数(越大越扎堆)
+        printf("[FT] total=%zu  empty_cells=%d/%d  max_cell=%d  grid:\n",
+               pts.size(), empty_cells, FEAT_GRID_R * FEAT_GRID_C, max_cell);
+        for (int r = 0; r < FEAT_GRID_R; r++)
+        {
+            printf("[FT]   ");
+            for (int c = 0; c < FEAT_GRID_C; c++)
+                printf("%3d ", grid[r][c]);
+            printf("\n");
+        }
+    }
+}
+} // anonymous namespace
+// ===================== end FEATURE LOGGING =====================
 
 bool FeatureTracker::inBorder(const cv::Point2f &pt)
 {
@@ -395,6 +481,11 @@ map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> FeatureTracker::trackIm
             featureFrame[feature_id].emplace_back(camera_id,  xyz_uv_velocity);
         }
     }
+
+    // ===== FEATURE LOGGING (added) =====
+    // 此处 cur_pts / ids / track_cnt 已是最终送进后端的左相机点 (一一对齐).
+    logFeatureStats(cur_time, cur_pts, ids, track_cnt, row, col);
+    // ===================================
 
     //printf("feature track whole time %f\n", t_r.toc());
     return featureFrame;

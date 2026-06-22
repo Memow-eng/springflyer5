@@ -82,8 +82,8 @@ show_track: 1           # publish tracking image as topic
 flow_back: 1            # perform forward and backward optical flow to improve feature tracking accuracy
 
 #frontend degradation handling
-frontend_adaptive_feature: 1
-frontend_gradient_points: 1
+frontend_adaptive_feature: 0
+frontend_gradient_points: 0
 frontend_low_quality: 0.006
 frontend_min_quality: 0.002
 frontend_degraded_min_dist_ratio: 0.6
@@ -95,7 +95,7 @@ blind_enable: 1
 blind_enter_track_num: 8          # enter BLIND if tracked features fall below this
 blind_exit_track_num: 45          # leave BLIND only after enough tracks recover
 blind_degraded_track_num: 25      # DEGRADED below this; visual residuals are down-weighted
-blind_parallax_threshold: 1.0     # px; low parallax keeps the frontend in DEGRADED
+blind_parallax_threshold: 2.0     # px; low parallax keeps the frontend in DEGRADED
 blind_visual_weight_degraded: 0.7
 
 #blind bias anchor.  Start conservative and tune from Allan/bag residuals.
