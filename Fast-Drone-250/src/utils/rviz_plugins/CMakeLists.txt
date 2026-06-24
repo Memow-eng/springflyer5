@@ -4,16 +4,17 @@ project(rviz_plugins)
 add_compile_options(-std=c++11)
 
 find_package(catkin REQUIRED COMPONENTS
+  geometry_msgs
+  quadrotor_msgs
   roscpp
   rviz
-  quadrotor_msgs
+  tf
 )
 
 catkin_package(
 #  INCLUDE_DIRS include
-#  LIBRARIES irobot_msgs
-  DEPENDS system_lib
-          message_runtime
+  LIBRARIES ${PROJECT_NAME}
+  CATKIN_DEPENDS geometry_msgs quadrotor_msgs roscpp rviz tf
 )
 
 ###########
@@ -63,7 +64,7 @@ include_directories(
 
 add_library(${PROJECT_NAME} ${SOURCE_FILES})
 
-add_dependencies(${PROJECT_NAME} multi_map_server_generate_messages_cpp)
+add_dependencies(${PROJECT_NAME} ${catkin_EXPORTED_TARGETS})
 
 target_link_libraries(${PROJECT_NAME}
     ${catkin_LIBRARIES}

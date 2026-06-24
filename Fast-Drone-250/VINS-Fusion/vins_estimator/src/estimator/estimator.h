@@ -38,6 +38,24 @@
 #include "../factor/projectionOneFrameTwoCamFactor.h"
 #include "../featureTracker/feature_tracker.h"
 
+struct FeatureMeasurement
+{
+    FeatureMeasurement()
+        : t(0.0)
+    {
+    }
+
+    FeatureMeasurement(double _t,
+                       const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &_features,
+                       const FrontendQuality &_quality)
+        : t(_t), features(_features), quality(_quality)
+    {
+    }
+
+    double t;
+    map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> features;
+    FrontendQuality quality;
+};
 
 class Estimator
 {
@@ -54,7 +72,9 @@ class Estimator
     void inputFeature(double t, const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &featureFrame);
     void inputImage(double t, const cv::Mat &_img, const cv::Mat &_img1 = cv::Mat());
     void processIMU(double t, double dt, const Vector3d &linear_acceleration, const Vector3d &angular_velocity);
-    void processImage(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, const double header);
+    void processImage(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image,
+                      const double header,
+                      const FrontendQuality &frontend_quality);
     void processMeasurements();
     void changeSensorType(int use_imu, int use_stereo);
 
@@ -83,10 +103,15 @@ class Estimator
     void fastPredictIMU(double t, Eigen::Vector3d linear_acceleration, Eigen::Vector3d angular_velocity);
     bool IMUAvailable(double t);
     void initFirstIMUPose(vector<pair<double, Eigen::Vector3d>> &accVector);
-    void updateVisualHealth(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, double header);
+    void updateVisualHealth(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image,
+                            const FrontendQuality &frontend_quality,
+                            double header);
+    bool shouldSkipVisualFrame(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image,
+                               const FrontendQuality &frontend_quality) const;
     void enterBlind(double header);
     void exitBlind(double header);
     void addBlindFactors(ceres::Problem &problem, ceres::LossFunction *loss_function);
+    bool clampBlindBiases();
     bool isBlind() const;
     bool isVisualDegraded() const;
     bool isLowDynamic(int frame_index) const;
@@ -118,7 +143,7 @@ class Estimator
     std::mutex mTracker;
     queue<pair<double, Eigen::Vector3d>> accBuf;
     queue<pair<double, Eigen::Vector3d>> gyrBuf;
-    queue<pair<double, map<int, vector<pair<int, Eigen::Matrix<double, 7, 1> > > > > > featureBuf;
+    queue<FeatureMeasurement> featureBuf;
     double prevTime, curTime;
     bool openExEstimation;
 
@@ -205,6 +230,7 @@ class Estimator
     Eigen::Vector3d blind_ba0;
     Eigen::Vector3d blind_bg0;
     Eigen::Vector3d blind_acc_body0;
+    Eigen::Vector3d blind_v0;
     std::mutex mThrust;
     std::deque<std::pair<double, double>> thrustBuf;
 };

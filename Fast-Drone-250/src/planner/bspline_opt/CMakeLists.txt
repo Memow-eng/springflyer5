@@ -7,7 +7,6 @@ ADD_COMPILE_OPTIONS(-std=c++14 )
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall -g")
 
 find_package(Eigen3 REQUIRED)
-find_package(PCL 1.7 REQUIRED)
 
 find_package(catkin REQUIRED COMPONENTS
   roscpp
@@ -31,8 +30,7 @@ include_directories(
     SYSTEM 
     include 
     ${catkin_INCLUDE_DIRS}
-    ${Eigen3_INCLUDE_DIRS} 
-    ${PCL_INCLUDE_DIRS}
+    ${EIGEN3_INCLUDE_DIR}
 )
 
 add_library( bspline_opt 

@@ -1499,9 +1499,34 @@ void Estimator::optimization()
             int imu_i = it_per_id.start_frame, imu_j = imu_i - 1;
             
             Vector3d pts_i = it_per_id.feature_per_frame[0].point;
+            // If a feature has many observations, subsample redundant ones by parallax.
+            const int max_obs = 20; // keep at most this many observations per feature
+            int obs_n = static_cast<int>(it_per_id.feature_per_frame.size());
+            std::vector<char> keep(obs_n, 1);
+            if (obs_n > max_obs)
+            {
+                // compute parallax wrt first observation and select top-k
+                std::vector<std::pair<double, int>> scores; scores.reserve(obs_n - 1);
+                for (int idx = 1; idx < obs_n; ++idx)
+                {
+                    Vector3d pts_j = it_per_id.feature_per_frame[idx].point;
+                    double parallax = (pts_i.head<2>() - pts_j.head<2>()).norm();
+                    scores.emplace_back(parallax, idx);
+                }
+                std::sort(scores.begin(), scores.end(), [](const auto &a, const auto &b){ return a.first > b.first; });
+                // keep first (anchor) and top (max_obs-1) others
+                std::fill(keep.begin(), keep.end(), 0);
+                keep[0] = 1;
+                int to_keep = std::min(max_obs - 1, static_cast<int>(scores.size()));
+                for (int k = 0; k < to_keep; ++k)
+                    keep[scores[k].second] = 1;
+            }
 
+            int frame_idx = 0;
             for (auto &it_per_frame : it_per_id.feature_per_frame)
             {
+                // skip observation if we decided not to keep it
+                if (!keep[frame_idx]) { imu_j++; frame_idx++; continue; }
                 imu_j++;
                 if (imu_i != imu_j)
                 {
@@ -1529,6 +1554,7 @@ void Estimator::optimization()
                    
                 }
                 f_m_cnt++;
+                frame_idx++;
             }
         }
     }

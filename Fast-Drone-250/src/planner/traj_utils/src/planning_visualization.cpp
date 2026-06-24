@@ -183,7 +183,7 @@ namespace ego_planner
     }
     last_nums = 0;
 
-    for ( int id=0; id<init_trajs.size(); id++ )
+    for ( int id=0; id<static_cast<int>(init_trajs.size()); id++ )
     {
       Eigen::Vector4d color(0, 0, 1, 0.7);
       displayMarkerList(init_list_pub, init_trajs[id], scale, color, id, false);

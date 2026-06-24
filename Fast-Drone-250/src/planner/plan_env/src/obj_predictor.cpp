@@ -53,7 +53,7 @@ void ObjHistory::poseCallback(const geometry_msgs::PoseStampedConstPtr& msg) {
   history_.push_back(pos_t);
   // cout << "idx: " << obj_idx_ << "pos_t: " << pos_t.transpose() << endl;
 
-  if (history_.size() > queue_size_) history_.pop_front();
+  if (queue_size_ > 0 && history_.size() > static_cast<size_t>(queue_size_)) history_.pop_front();
 
   skip_ = 0;
 }

@@ -33,11 +33,35 @@ bool inBorder(const cv::Point2f &pt);
 void reduceVector(vector<cv::Point2f> &v, vector<uchar> status);
 void reduceVector(vector<int> &v, vector<uchar> status);
 
+struct FrontendQuality
+{
+    FrontendQuality();
+
+    int prev_points;
+    int tracked_after_lk;
+    int tracked_after_ransac;
+    int new_points;
+    int total_points;
+    int occupied_cells;
+    int grid_cols;
+    int grid_rows;
+    double lk_keep_ratio;
+    double mean_lk_error;
+    double mean_fb_error;
+    double mean_track_eigen;
+    double coverage_ratio;
+    bool low_tracking_quality;
+    bool weak_texture;
+    bool poor_distribution;
+    bool ransac_rejected;
+};
+
 class FeatureTracker
 {
 public:
     FeatureTracker();
     map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> trackImage(double _cur_time, const cv::Mat &_img, const cv::Mat &_img1 = cv::Mat());
+    const FrontendQuality &getLastFrontendQuality() const;
     void setMask();
     void readIntrinsicParameter(const vector<string> &calib_file);
     void showUndistortion(const string &name);
@@ -84,4 +108,5 @@ public:
     bool stereo_cam;
     int n_id;
     bool hasPrediction;
+    FrontendQuality last_quality;
 };

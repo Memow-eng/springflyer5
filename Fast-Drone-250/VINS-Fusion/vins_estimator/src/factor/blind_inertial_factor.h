@@ -75,6 +75,36 @@ class GroundZuptFactor : public ceres::SizedCostFunction<3, 9>
     double weight_;
 };
 
+class VelocityPriorFactor : public ceres::SizedCostFunction<3, 9>
+{
+  public:
+    VelocityPriorFactor(const Eigen::Vector3d &v0, double weight)
+        : v0_(v0), weight_(weight)
+    {
+    }
+
+    virtual bool Evaluate(double const *const *parameters,
+                          double *residuals,
+                          double **jacobians) const
+    {
+        Eigen::Map<const Eigen::Vector3d> v(parameters[0]);
+        Eigen::Map<Eigen::Vector3d> r(residuals);
+        r = weight_ * (v - v0_);
+
+        if (jacobians && jacobians[0])
+        {
+            Eigen::Map<Eigen::Matrix<double, 3, 9, Eigen::RowMajor>> J(jacobians[0]);
+            J.setZero();
+            J.block<3, 3>(0, 0) = weight_ * Eigen::Matrix3d::Identity();
+        }
+        return true;
+    }
+
+  private:
+    Eigen::Vector3d v0_;
+    double weight_;
+};
+
 struct GravityDirectionFactor
 {
     GravityDirectionFactor(const Eigen::Vector3d &g_world_unit,

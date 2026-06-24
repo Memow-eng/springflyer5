@@ -127,7 +127,7 @@ void sync_process()
                 estimator.inputImage(time, image);
         }
 
-        std::chrono::milliseconds dura(2);
+        std::chrono::milliseconds dura(IMAGE_SYNC_SLEEP_MS);
         std::this_thread::sleep_for(dura);
     }
 }
@@ -246,6 +246,8 @@ int main(int argc, char **argv)
     printf("config_file: %s\n", argv[1]);
 
     readParameters(config_file);
+    if (OPENCV_NUM_THREADS > 0)
+        cv::setNumThreads(OPENCV_NUM_THREADS);
     estimator.setParameter();
 
 #ifdef EIGEN_DONT_PARALLELIZE

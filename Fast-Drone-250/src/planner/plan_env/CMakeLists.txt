@@ -10,22 +10,26 @@ find_package(OpenCV REQUIRED)
 
 
 find_package(catkin REQUIRED COMPONENTS
+  cv_bridge
+  geometry_msgs
+  message_filters
+  nav_msgs
   roscpp
   rospy
+  sensor_msgs
   std_msgs
   visualization_msgs
-  cv_bridge
-  message_filters
+  pcl_conversions
 )
 
 find_package(Eigen3 REQUIRED)
-find_package(PCL 1.7 REQUIRED)
+find_package(PCL 1.7 REQUIRED COMPONENTS common)
 
 catkin_package(
  INCLUDE_DIRS include
  LIBRARIES plan_env
- CATKIN_DEPENDS roscpp std_msgs
- DEPENDS OpenCV
+ CATKIN_DEPENDS roscpp rospy std_msgs geometry_msgs nav_msgs sensor_msgs visualization_msgs cv_bridge message_filters pcl_conversions
+ DEPENDS OpenCV PCL
 #  DEPENDS system_lib
 )
 
@@ -33,7 +37,7 @@ include_directories(
     SYSTEM 
     include 
     ${catkin_INCLUDE_DIRS}
-    ${Eigen3_INCLUDE_DIRS} 
+    ${EIGEN3_INCLUDE_DIR}
     ${PCL_INCLUDE_DIRS}
     ${OpenCV_INCLUDE_DIRS}
 )

@@ -98,6 +98,27 @@ void logFeatureStats(double t,
 } // anonymous namespace
 // ===================== end FEATURE LOGGING =====================
 
+FrontendQuality::FrontendQuality()
+    : prev_points(0),
+      tracked_after_lk(0),
+      tracked_after_ransac(0),
+      new_points(0),
+      total_points(0),
+      occupied_cells(0),
+      grid_cols(0),
+      grid_rows(0),
+      lk_keep_ratio(1.0),
+      mean_lk_error(-1.0),
+      mean_fb_error(-1.0),
+      mean_track_eigen(-1.0),
+      coverage_ratio(0.0),
+      low_tracking_quality(false),
+      weak_texture(false),
+      poor_distribution(false),
+      ransac_rejected(false)
+{
+}
+
 bool FeatureTracker::inBorder(const cv::Point2f &pt)
 {
     const int BORDER_SIZE = 1;
@@ -137,6 +158,7 @@ FeatureTracker::FeatureTracker()
     stereo_cam = 0;
     n_id = 0;
     hasPrediction = false;
+    last_quality = FrontendQuality();
 }
 
 void FeatureTracker::setMask()
@@ -269,6 +291,7 @@ double FeatureTracker::distance(cv::Point2f &pt1, cv::Point2f &pt2)
 map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> FeatureTracker::trackImage(double _cur_time, const cv::Mat &_img, const cv::Mat &_img1)
 {
     TicToc t_r;
+    last_quality = FrontendQuality();
     cur_time = _cur_time;
     cur_img = _img;
     row = cur_img.rows;
@@ -289,6 +312,7 @@ map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> FeatureTracker::trackIm
         TicToc t_o;
         vector<uchar> status;
         vector<float> err;
+        last_quality.prev_points = static_cast<int>(prev_pts.size());
         if(hasPrediction)
         {
             cur_pts = predict_pts;
@@ -328,6 +352,16 @@ map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> FeatureTracker::trackIm
         for (int i = 0; i < int(cur_pts.size()); i++)
             if (status[i] && !inBorder(cur_pts[i]))
                 status[i] = 0;
+        int kept_cnt = 0;
+        for (uchar s : status)
+            kept_cnt += s ? 1 : 0;
+        last_quality.tracked_after_lk = kept_cnt;
+        last_quality.lk_keep_ratio = last_quality.prev_points > 0
+                                         ? static_cast<double>(kept_cnt) / static_cast<double>(last_quality.prev_points)
+                                         : 1.0;
+        last_quality.low_tracking_quality =
+            last_quality.prev_points >= FRONTEND_QUALITY_MIN_TRACKED &&
+            last_quality.lk_keep_ratio < FRONTEND_MIN_LK_KEEP_RATIO;
         reduceVector(prev_pts, status);
         reduceVector(cur_pts, status);
         reduceVector(ids, status);
@@ -374,6 +408,54 @@ map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> FeatureTracker::trackIm
             ids.push_back(n_id++);
             track_cnt.push_back(1);
         }
+        last_quality.new_points = static_cast<int>(n_pts.size());
+        last_quality.tracked_after_ransac = static_cast<int>(cur_pts.size());
+        last_quality.total_points = static_cast<int>(cur_pts.size());
+        if (!cur_pts.empty() && !cur_img.empty())
+        {
+            cv::Mat eig;
+            cv::cornerMinEigenVal(cur_img, eig, 3, 3);
+            double eig_sum = 0.0;
+            int eig_num = 0;
+            for (const auto &p : cur_pts)
+            {
+                int x = cvRound(p.x);
+                int y = cvRound(p.y);
+                if (0 <= x && x < eig.cols && 0 <= y && y < eig.rows)
+                {
+                    eig_sum += eig.at<float>(y, x);
+                    eig_num++;
+                }
+            }
+            if (eig_num > 0)
+                last_quality.mean_track_eigen = eig_sum / static_cast<double>(eig_num);
+        }
+        last_quality.grid_rows = std::max(1, FRONTEND_QUALITY_GRID_ROWS);
+        last_quality.grid_cols = std::max(1, FRONTEND_QUALITY_GRID_COLS);
+        if (row > 0 && col > 0)
+        {
+            vector<uchar> occupied(last_quality.grid_rows * last_quality.grid_cols, 0);
+            for (const auto &p : cur_pts)
+            {
+                int gx = std::min(last_quality.grid_cols - 1,
+                                  std::max(0, static_cast<int>(p.x * last_quality.grid_cols / col)));
+                int gy = std::min(last_quality.grid_rows - 1,
+                                  std::max(0, static_cast<int>(p.y * last_quality.grid_rows / row)));
+                occupied[gy * last_quality.grid_cols + gx] = 1;
+            }
+            for (uchar s : occupied)
+                last_quality.occupied_cells += s ? 1 : 0;
+            last_quality.coverage_ratio =
+                static_cast<double>(last_quality.occupied_cells) /
+                static_cast<double>(last_quality.grid_rows * last_quality.grid_cols);
+        }
+        last_quality.weak_texture =
+            last_quality.total_points < FRONTEND_MIN_QUALITY_POINTS ||
+            (last_quality.mean_track_eigen >= 0.0 &&
+             last_quality.mean_track_eigen < FRONTEND_QUALITY_MIN_EIGEN);
+        last_quality.poor_distribution =
+            last_quality.total_points >= FRONTEND_MIN_QUALITY_POINTS &&
+            last_quality.coverage_ratio < FRONTEND_MIN_COVERAGE_RATIO;
         //printf("feature cnt after add %d\n", (int)ids.size());
     }
 
@@ -489,6 +571,11 @@ map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> FeatureTracker::trackIm
 
     //printf("feature track whole time %f\n", t_r.toc());
     return featureFrame;
+}
+
+const FrontendQuality &FeatureTracker::getLastFrontendQuality() const
+{
+    return last_quality;
 }
 
 void FeatureTracker::rejectWithF()

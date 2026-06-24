@@ -13,7 +13,7 @@ image1_topic: "/camera/infra2/image_rect_raw"
 
 
 
-output_path: "/home/wj/vins_output"
+output_path: "/tmp/vins_output"
 
 
 cam0_calib: "left.yaml"
@@ -74,16 +74,30 @@ body_T_cam1: !!opencv-matrix
 multiple_thread: 1
 
 #feature traker paprameters
-max_cnt: 150            # max feature number in feature tracking
-min_dist: 30            # min distance between two features 
+max_cnt: 180            # max feature number in feature tracking
+min_dist: 8            # min distance between two features 
 freq: 10                # frequence (Hz) of publish tracking result. At least 10Hz for good estimation. If set 0, the frequence will be same as raw image 
 F_threshold: 1.0        # ransac threshold (pixel)
-show_track: 1           # publish tracking image as topic
+show_track: 0           # publish tracking image as topic
 flow_back: 1            # perform forward and backward optical flow to improve feature tracking accuracy
 
+# onboard CPU budget. Keep defaults conservative; set backend_frame_stride=1
+# offline or on a stronger computer when chasing maximum accuracy.
+ceres_num_threads: 2
+marginalization_num_threads: 2
+opencv_num_threads: 2
+backend_frame_stride: 1
+image_sync_sleep_ms: 3
+process_sleep_ms: 3
+feature_log_enable: 1
+feature_log_path: "/tmp/vins_feature_points.csv"
+feature_log_print_every: 30
+feature_log_flush_every: 100
+
 #frontend degradation handling
-frontend_adaptive_feature: 0
-frontend_gradient_points: 0
+frontend_adaptive_feature: 1
+frontend_gradient_points: 1
+frontend_reject_with_f: 0
 frontend_low_quality: 0.006
 frontend_min_quality: 0.002
 frontend_degraded_min_dist_ratio: 0.6
@@ -92,19 +106,23 @@ frontend_gradient_min: 0.000001
 
 #visual degradation / blind inertial MAP parameters
 blind_enable: 1
-blind_enter_track_num: 8          # enter BLIND if tracked features fall below this
-blind_exit_track_num: 45          # leave BLIND only after enough tracks recover
-blind_degraded_track_num: 25      # DEGRADED below this; visual residuals are down-weighted
+blind_enter_track_num: 20         # enter BLIND if tracked features fall below this
+blind_exit_track_num: 70          # leave BLIND only after enough tracks recover
+blind_degraded_track_num: 8     # DEGRADED below this; visual residuals are down-weighted
 blind_parallax_threshold: 2.0     # px; low parallax keeps the frontend in DEGRADED
 blind_visual_weight_degraded: 0.7
 
 #blind bias anchor.  Start conservative and tune from Allan/bag residuals.
-blind_bias_acc_sigma: 0.03        # m/s^2
-blind_bias_gyr_sigma: 0.002       # rad/s
-blind_bias_relax_rate: 0.25       # per second; larger means trust the lock-in bias less over time
+blind_bias_acc_sigma: 0.02        # m/s^2
+blind_bias_gyr_sigma: 0.0015      # rad/s
+blind_bias_relax_rate: 0.18       # per second; larger means trust the lock-in bias less over time
+blind_bias_relax_max: 2.0
+blind_bias_acc_max: 1.2
+blind_bias_gyr_max: 0.35
+blind_velocity_prior_weight: 0.5
 
 #low-dynamic gravity/ZUPT priors.  These only trigger when IMU looks ground-static.
-blind_tilt_weight: 1.0
+blind_tilt_weight: 2.0
 blind_tilt_max_acc_dev: 0.8       # |mean(acc)| must be within this of g
 blind_tilt_max_gyr: 0.08          # rad/s, reserved for low-dynamic gating
 blind_zupt_weight: 2.0
@@ -135,5 +153,5 @@ td: -0.05                             # initial value of time offset. unit: s. r
 
 #loop closure parameters
 load_previous_pose_graph: 0        # load and reuse previous pose graph; load from 'pose_graph_save_path'
-pose_graph_save_path: "/home/fast/savedfiles/output/pose_graph/" # save and load path
-save_image: 1                   # save image in pose graph for visualization prupose; you can close this function by setting 0 
+pose_graph_save_path: "/tmp/vins_pose_graph/" # save and load path
+save_image: 0                   # save image in pose graph for visualization prupose; you can close this function by setting 0 

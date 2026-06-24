@@ -54,6 +54,7 @@ void Estimator::clearState()
     blind_ba0.setZero();
     blind_bg0.setZero();
     blind_acc_body0.setZero();
+    blind_v0.setZero();
     {
         std::lock_guard<std::mutex> lock(mThrust);
         thrustBuf.clear();
@@ -176,17 +177,16 @@ void Estimator::inputImage(double t, const cv::Mat &_img, const cv::Mat &_img1)
 {
     inputImageCnt++;
     map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> featureFrame;
+    FrontendQuality frontendQuality;
     TicToc featureTrackerTime;
 
-    if(_img1.empty())
     {
         std::lock_guard<std::mutex> lock(mTracker);
-        featureFrame = featureTracker.trackImage(t, _img);
-    }
-    else
-    {
-        std::lock_guard<std::mutex> lock(mTracker);
-        featureFrame = featureTracker.trackImage(t, _img, _img1);
+        if(_img1.empty())
+            featureFrame = featureTracker.trackImage(t, _img);
+        else
+            featureFrame = featureTracker.trackImage(t, _img, _img1);
+        frontendQuality = featureTracker.getLastFrontendQuality();
     }
     //printf("featureTracker time: %f\n", featureTrackerTime.toc());
 
@@ -202,14 +202,14 @@ void Estimator::inputImage(double t, const cv::Mat &_img, const cv::Mat &_img1)
         if(inputImageCnt % 2 == 0)
         {
             mBuf.lock();
-            featureBuf.push(make_pair(t, featureFrame));
+            featureBuf.push(FeatureMeasurement(t, featureFrame, frontendQuality));
             mBuf.unlock();
         }
     }
     else
     {
         mBuf.lock();
-        featureBuf.push(make_pair(t, featureFrame));
+        featureBuf.push(FeatureMeasurement(t, featureFrame, frontendQuality));
         mBuf.unlock();
         TicToc processTime;
         processMeasurements();
@@ -269,8 +269,12 @@ double Estimator::getThrustAcc(double t)
 
 void Estimator::inputFeature(double t, const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &featureFrame)
 {
+    FrontendQuality frontendQuality;
+    frontendQuality.total_points = static_cast<int>(featureFrame.size());
+    frontendQuality.tracked_after_lk = frontendQuality.total_points;
+    frontendQuality.tracked_after_ransac = frontendQuality.total_points;
     mBuf.lock();
-    featureBuf.push(make_pair(t, featureFrame));
+    featureBuf.push(FeatureMeasurement(t, featureFrame, frontendQuality));
     mBuf.unlock();
 
     if(!MULTIPLE_THREAD)
@@ -326,15 +330,15 @@ void Estimator::processMeasurements()
     while (1)
     {
         //printf("process measurments\n");
-        pair<double, map<int, vector<pair<int, Eigen::Matrix<double, 7, 1> > > > > feature;
+        FeatureMeasurement feature;
         vector<pair<double, Eigen::Vector3d>> accVector, gyrVector;
         if(!featureBuf.empty())
         {
             feature = featureBuf.front();
-            curTime = feature.first + td;
+            curTime = feature.t + td;
             while(1)
             {
-                if ((!USE_IMU  || IMUAvailable(feature.first + td)))
+                if ((!USE_IMU  || IMUAvailable(feature.t + td)))
                     break;
                 else
                 {
@@ -369,14 +373,14 @@ void Estimator::processMeasurements()
                 }
             }
             mProcess.lock();
-            processImage(feature.second, feature.first);
+            processImage(feature.features, feature.t, feature.quality);
             prevTime = curTime;
 
             printStatistics(*this, 0);
 
             std_msgs::Header header;
             header.frame_id = "world";
-            header.stamp = ros::Time(feature.first);
+            header.stamp = ros::Time(feature.t);
 
             pubOdometry(*this, header);
             pubKeyPoses(*this, header);
@@ -462,18 +466,25 @@ void Estimator::processIMU(double t, double dt, const Vector3d &linear_accelerat
     gyr_0 = angular_velocity; 
 }
 
-void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, const double header)
+void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image,
+                             const double header,
+                             const FrontendQuality &frontend_quality)
 {
     ROS_DEBUG("new image coming ------------------------------------------");
     ROS_DEBUG("Adding feature points %lu", image.size());
-    bool hold_blind_visual = isBlind() && static_cast<int>(image.size()) < BLIND_EXIT_TRACK_NUM;
-    if (hold_blind_visual)
+    const bool skip_visual_frame = shouldSkipVisualFrame(image, frontend_quality);
+    const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> empty_image;
+    const auto &backend_image = skip_visual_frame ? empty_image : image;
+
+    if (skip_visual_frame)
     {
-        f_manager.last_track_num = static_cast<int>(image.size());
+        f_manager.last_track_num = frontend_quality.prev_points > 0
+                                       ? frontend_quality.tracked_after_lk
+                                       : static_cast<int>(image.size());
         f_manager.last_average_parallax = 0.0;
         marginalization_flag = MARGIN_OLD;
     }
-    else if (f_manager.addFeatureCheckParallax(frame_count, image, td))
+    else if (f_manager.addFeatureCheckParallax(frame_count, backend_image, td))
     {
         marginalization_flag = MARGIN_OLD;
         //printf("keyframe\n");
@@ -483,15 +494,14 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
         marginalization_flag = MARGIN_SECOND_NEW;
         //printf("non-keyframe\n");
     }
-    updateVisualHealth(image, header);
+    updateVisualHealth(image, frontend_quality, header);
 
     ROS_DEBUG("%s", marginalization_flag ? "Non-keyframe" : "Keyframe");
     ROS_DEBUG("Solving %d", frame_count);
     ROS_DEBUG("number of feature: %d", f_manager.getFeatureCount());
     Headers[frame_count] = header;
 
-    const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> empty_image;
-    ImageFrame imageframe(hold_blind_visual ? empty_image : image, header);
+    ImageFrame imageframe(backend_image, header);
     imageframe.pre_integration = tmp_pre_integration;
     all_image_frame.insert(make_pair(header, imageframe));
     tmp_pre_integration = new IntegrationBase{acc_0, gyr_0, Bas[frame_count], Bgs[frame_count]};
@@ -1027,18 +1037,33 @@ void Estimator::double2vector()
 
 bool Estimator::failureDetection()
 {
-    return false;
     if (f_manager.last_track_num < 2)
     {
         ROS_INFO(" little feature %d", f_manager.last_track_num);
         //return true;
     }
-    if (Bas[WINDOW_SIZE].norm() > 2.5)
+
+    if (!Ps[WINDOW_SIZE].allFinite() || !Rs[WINDOW_SIZE].allFinite())
+    {
+        ROS_WARN("non-finite pose state");
+        return true;
+    }
+    if (USE_IMU && (!Vs[WINDOW_SIZE].allFinite() ||
+                    !Bas[WINDOW_SIZE].allFinite() ||
+                    !Bgs[WINDOW_SIZE].allFinite()))
+    {
+        ROS_WARN("non-finite speed/bias state");
+        return true;
+    }
+
+    const double acc_bias_max = std::max(0.1, BLIND_BIAS_ACC_MAX);
+    const double gyr_bias_max = std::max(0.01, BLIND_BIAS_GYR_MAX);
+    if (USE_IMU && Bas[WINDOW_SIZE].norm() > acc_bias_max)
     {
         ROS_INFO(" big IMU acc bias estimation %f", Bas[WINDOW_SIZE].norm());
         return true;
     }
-    if (Bgs[WINDOW_SIZE].norm() > 1.0)
+    if (USE_IMU && Bgs[WINDOW_SIZE].norm() > gyr_bias_max)
     {
         ROS_INFO(" big IMU gyr bias estimation %f", Bgs[WINDOW_SIZE].norm());
         return true;
@@ -1102,6 +1127,8 @@ void Estimator::enterBlind(double header)
     blind_ba0 = Bas[frame_count];
     blind_bg0 = Bgs[frame_count];
     blind_acc_body0 = acc_0;
+    blind_v0 = Vs[frame_count];
+    f_manager.clearState();
     if (blind_acc_body0.norm() > 1e-3)
         blind_acc_body0.normalize();
     ROS_WARN("VINS visual BLIND enter: tracks=%d parallax=%.2f", visual_track_num, visual_parallax);
@@ -1117,7 +1144,40 @@ void Estimator::exitBlind(double header)
     blind_active = false;
 }
 
+bool Estimator::shouldSkipVisualFrame(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image,
+                                      const FrontendQuality &frontend_quality) const
+{
+    if (!BLIND_ENABLE || !USE_IMU || solver_flag != NON_LINEAR)
+        return false;
+
+    const int image_points = static_cast<int>(image.size());
+    const int tracked_points = frontend_quality.prev_points > 0
+                                   ? frontend_quality.tracked_after_lk
+                                   : image_points;
+    const bool very_few_tracks = tracked_points <= BLIND_ENTER_TRACK_NUM ||
+                                 image_points <= BLIND_ENTER_TRACK_NUM;
+    const bool severe_lk_loss =
+        frontend_quality.prev_points >= FRONTEND_QUALITY_MIN_TRACKED &&
+        frontend_quality.lk_keep_ratio < 0.2 &&
+        tracked_points <= BLIND_DEGRADED_TRACK_NUM;
+    const bool severe_texture =
+        frontend_quality.mean_track_eigen >= 0.0 &&
+        frontend_quality.mean_track_eigen < FRONTEND_QUALITY_MIN_EIGEN;
+    const bool weak_texture_with_few_tracks =
+        frontend_quality.weak_texture && tracked_points <= BLIND_DEGRADED_TRACK_NUM;
+    const bool hold_blind_until_recovered =
+        visual_state == VISUAL_BLIND && blind_active &&
+        (tracked_points < BLIND_EXIT_TRACK_NUM ||
+         frontend_quality.low_tracking_quality ||
+         frontend_quality.weak_texture ||
+         frontend_quality.poor_distribution);
+
+    return very_few_tracks || severe_lk_loss || severe_texture ||
+           weak_texture_with_few_tracks || hold_blind_until_recovered;
+}
+
 void Estimator::updateVisualHealth(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image,
+                                   const FrontendQuality &frontend_quality,
                                    double header)
 {
     if (!BLIND_ENABLE || solver_flag != NON_LINEAR)
@@ -1125,9 +1185,32 @@ void Estimator::updateVisualHealth(const map<int, vector<pair<int, Eigen::Matrix
 
     visual_track_num = f_manager.last_track_num;
     visual_parallax = f_manager.last_average_parallax;
+    const bool frontend_low_tracking = frontend_quality.low_tracking_quality;
+    const bool frontend_weak_texture = frontend_quality.weak_texture;
+    const bool frontend_poor_distribution = frontend_quality.poor_distribution;
+    const bool frontend_severe_texture =
+        frontend_quality.mean_track_eigen >= 0.0 &&
+        frontend_quality.mean_track_eigen < FRONTEND_QUALITY_MIN_EIGEN;
+    const int frontend_track_num = frontend_quality.prev_points > 0
+                                       ? frontend_quality.tracked_after_lk
+                                       : static_cast<int>(image.size());
+    const bool frontend_ransac_bad =
+        frontend_quality.prev_points >= FRONTEND_QUALITY_MIN_TRACKED &&
+        frontend_quality.tracked_after_ransac <= BLIND_DEGRADED_TRACK_NUM;
+    const bool frontend_degraded = frontend_low_tracking || frontend_weak_texture ||
+                                   frontend_poor_distribution || frontend_ransac_bad;
+    const bool frontend_blind = static_cast<int>(image.size()) <= BLIND_ENTER_TRACK_NUM ||
+                                frontend_track_num <= BLIND_ENTER_TRACK_NUM ||
+                                frontend_severe_texture ||
+                                (frontend_weak_texture &&
+                                 frontend_track_num <= BLIND_DEGRADED_TRACK_NUM) ||
+                                (frontend_low_tracking &&
+                                 frontend_quality.lk_keep_ratio < 0.2 &&
+                                 frontend_track_num <= BLIND_DEGRADED_TRACK_NUM);
     const bool enough_tracks_to_exit = visual_track_num >= BLIND_EXIT_TRACK_NUM;
     const bool enough_parallax_to_exit = visual_parallax >= BLIND_PARALLAX_THRESHOLD;
-    const bool visual_recovered = enough_tracks_to_exit && enough_parallax_to_exit;
+    const bool visual_recovered = enough_tracks_to_exit && enough_parallax_to_exit &&
+                                  !frontend_degraded;
 
     VisualState next_state = visual_state;
     if (visual_state == VISUAL_BLIND)
@@ -1139,9 +1222,9 @@ void Estimator::updateVisualHealth(const map<int, vector<pair<int, Eigen::Matrix
     }
     else
     {
-        if (visual_track_num <= BLIND_ENTER_TRACK_NUM)
+        if (visual_track_num <= BLIND_ENTER_TRACK_NUM || frontend_blind)
             next_state = VISUAL_BLIND;
-        else if (visual_track_num <= BLIND_DEGRADED_TRACK_NUM)
+        else if (visual_track_num <= BLIND_DEGRADED_TRACK_NUM || frontend_degraded)
             next_state = VISUAL_DEGRADED;
         else if (visual_recovered)
             next_state = VISUAL_HEALTHY;
@@ -1156,9 +1239,11 @@ void Estimator::updateVisualHealth(const map<int, vector<pair<int, Eigen::Matrix
 
     if (next_state != visual_state)
     {
-        ROS_DEBUG("VINS visual state %d -> %d, tracks=%d, parallax=%.2f",
+        ROS_WARN("VINS visual state %d -> %d, tracks=%d, parallax=%.2f, pts=%d, keep=%.2f, eig=%.3g, cov=%.2f",
                  static_cast<int>(visual_state), static_cast<int>(next_state),
-                 visual_track_num, visual_parallax);
+                 visual_track_num, visual_parallax,
+                 frontend_quality.total_points, frontend_quality.lk_keep_ratio,
+                 frontend_quality.mean_track_eigen, frontend_quality.coverage_ratio);
     }
     if (next_state == VISUAL_HEALTHY && blind_anchor_valid)
     {
@@ -1215,7 +1300,8 @@ void Estimator::addBlindFactors(ceres::Problem &problem, ceres::LossFunction *lo
 
     const double current_time = Headers[frame_count];
     const double t_blind = blindDuration(current_time);
-    const double relax = 1.0 + BLIND_BIAS_RELAX_RATE * t_blind;
+    const double relax_max = std::max(1.0, BLIND_BIAS_RELAX_MAX);
+    const double relax = std::min(relax_max, 1.0 + BLIND_BIAS_RELAX_RATE * t_blind);
     Eigen::Matrix<double, 6, 6> sqrt_info = Eigen::Matrix<double, 6, 6>::Zero();
     sqrt_info.block<3, 3>(0, 0) =
         (1.0 / std::max(1e-6, BLIND_BIAS_ACC_SIGMA * relax)) * Eigen::Matrix3d::Identity();
@@ -1226,6 +1312,16 @@ void Estimator::addBlindFactors(ceres::Problem &problem, ceres::LossFunction *lo
     {
         BiasPriorFactor *bias_factor = new BiasPriorFactor(blind_ba0, blind_bg0, sqrt_info);
         problem.AddResidualBlock(bias_factor, loss_function, para_SpeedBias[i]);
+    }
+
+    if (BLIND_VELOCITY_PRIOR_WEIGHT > 0.0 && blind_v0.allFinite())
+    {
+        for (int i = 0; i <= frame_count; i++)
+        {
+            VelocityPriorFactor *velocity_factor =
+                new VelocityPriorFactor(blind_v0, BLIND_VELOCITY_PRIOR_WEIGHT);
+            problem.AddResidualBlock(velocity_factor, loss_function, para_SpeedBias[i]);
+        }
     }
 
     for (int i = 0; i <= frame_count; i++)
@@ -1271,6 +1367,51 @@ void Estimator::addBlindFactors(ceres::Problem &problem, ceres::LossFunction *lo
                                      para_Pose[i + 1], para_SpeedBias[i + 1]);
         }
     }
+}
+
+bool Estimator::clampBlindBiases()
+{
+    if (!BLIND_ENABLE || !USE_IMU || visual_state == VISUAL_HEALTHY)
+        return false;
+
+    const double acc_bias_max = std::max(0.1, BLIND_BIAS_ACC_MAX);
+    const double gyr_bias_max = std::max(0.01, BLIND_BIAS_GYR_MAX);
+    bool clamped = false;
+
+    for (int i = 0; i <= frame_count; i++)
+    {
+        if (!Bas[i].allFinite() || !Bgs[i].allFinite())
+            return false;
+
+        const double ba_norm = Bas[i].norm();
+        if (ba_norm > acc_bias_max)
+        {
+            Bas[i] *= acc_bias_max / ba_norm;
+            clamped = true;
+        }
+
+        const double bg_norm = Bgs[i].norm();
+        if (bg_norm > gyr_bias_max)
+        {
+            Bgs[i] *= gyr_bias_max / bg_norm;
+            clamped = true;
+        }
+    }
+
+    if (clamped)
+    {
+        ROS_WARN("VINS BLIND bias clamped: acc<=%.3f gyr<=%.3f",
+                 acc_bias_max, gyr_bias_max);
+        for (int i = 0; i <= frame_count; i++)
+        {
+            if (pre_integrations[i] != nullptr)
+                pre_integrations[i]->repropagate(Bas[i], Bgs[i]);
+        }
+        if (tmp_pre_integration != nullptr)
+            tmp_pre_integration->repropagate(Bas[frame_count], Bgs[frame_count]);
+    }
+
+    return clamped;
 }
 
 void Estimator::optimization()
@@ -1358,9 +1499,34 @@ void Estimator::optimization()
             int imu_i = it_per_id.start_frame, imu_j = imu_i - 1;
             
             Vector3d pts_i = it_per_id.feature_per_frame[0].point;
+            // If a feature has many observations, subsample redundant ones by parallax.
+            const int max_obs = 20; // keep at most this many observations per feature
+            int obs_n = static_cast<int>(it_per_id.feature_per_frame.size());
+            std::vector<char> keep(obs_n, 1);
+            if (obs_n > max_obs)
+            {
+                // compute parallax wrt first observation and select top-k
+                std::vector<std::pair<double, int>> scores; scores.reserve(obs_n - 1);
+                for (int idx = 1; idx < obs_n; ++idx)
+                {
+                    Vector3d pts_j = it_per_id.feature_per_frame[idx].point;
+                    double parallax = (pts_i.head<2>() - pts_j.head<2>()).norm();
+                    scores.emplace_back(parallax, idx);
+                }
+                std::sort(scores.begin(), scores.end(), [](const auto &a, const auto &b){ return a.first > b.first; });
+                // keep first (anchor) and top (max_obs-1) others
+                std::fill(keep.begin(), keep.end(), 0);
+                keep[0] = 1;
+                int to_keep = std::min(max_obs - 1, static_cast<int>(scores.size()));
+                for (int k = 0; k < to_keep; ++k)
+                    keep[scores[k].second] = 1;
+            }
 
+            int frame_idx = 0;
             for (auto &it_per_frame : it_per_id.feature_per_frame)
             {
+                // skip observation if we decided not to keep it
+                if (!keep[frame_idx]) { imu_j++; frame_idx++; continue; }
                 imu_j++;
                 if (imu_i != imu_j)
                 {
@@ -1388,6 +1554,7 @@ void Estimator::optimization()
                    
                 }
                 f_m_cnt++;
+                frame_idx++;
             }
         }
     }
@@ -1419,6 +1586,7 @@ void Estimator::optimization()
     //printf("solver costs: %f \n", t_solver.toc());
 
     double2vector();
+    clampBlindBiases();
     //printf("frame_count: %d \n", frame_count);
 
     if(frame_count < WINDOW_SIZE)
