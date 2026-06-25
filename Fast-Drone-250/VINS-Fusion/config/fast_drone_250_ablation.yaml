@@ -1,0 +1,133 @@
+%YAML:1.0
+
+# A/B baseline for bag debugging in the UAV setting.
+# Goal: isolate core VIO tracking/optimization behavior before re-enabling
+# online calibration and blind-mode bridging.
+
+#common parameters
+imu: 1
+num_of_cam: 2
+
+imu_topic: "/mavros/imu/data_raw"
+image0_topic: "/camera/infra1/image_rect_raw"
+image1_topic: "/camera/infra2/image_rect_raw"
+
+output_path: "/tmp/vins_output_ablation"
+
+cam0_calib: "left.yaml"
+cam1_calib: "right.yaml"
+image_width: 640
+image_height: 480
+
+# Fix extrinsics during debugging. When tracks are unstable, online calibration
+# tends to absorb frontend errors and makes red/green divergence harder to read.
+estimate_extrinsic: 0
+
+body_T_cam0: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: d
+   data: [ -0.00321371, -0.01084353,  0.99993604,  5.0565592201665305e-02,
+           -0.99996254,  0.00807174, -0.00312626, 2.1124785844035578e-02,
+           -0.00803732, -0.99990863, -0.01086906,  3.9024775279465504e-02,
+            0.0,         0.0,         0.0,         1.0 ]
+
+body_T_cam1: !!opencv-matrix
+   rows: 4
+   cols: 4
+   dt: d
+   data: [ -0.00321371, -0.01084353,  0.99993604, 5.0114710469528974e-02,
+           -0.99996254,  0.00807174, -0.00312626, -2.9537884753658383e-02,
+           -0.00803732, -0.99990863, -0.01086906, 3.8897111872464522e-02,
+            0.0,         0.0,         0.0,         1.0 ]
+
+# threading
+multiple_thread: 1
+ceres_num_threads: 2
+marginalization_num_threads: 2
+opencv_num_threads: 2
+backend_frame_stride: 1
+image_sync_sleep_ms: 3
+process_sleep_ms: 3
+
+# feature tracking
+max_cnt: 180
+min_dist: 8
+freq: 10
+F_threshold: 1.0
+show_track: 0
+flow_back: 1
+
+feature_log_enable: 1
+feature_log_path: "/tmp/vins_feature_points.csv"
+feature_log_print_every: 30
+feature_log_flush_every: 100
+
+frontend_adaptive_feature: 1
+frontend_gradient_points: 1
+frontend_low_quality: 0.006
+frontend_min_quality: 0.002
+frontend_degraded_min_dist_ratio: 0.6
+frontend_gradient_grid: 32
+frontend_gradient_min: 0.000001
+frontend_fb_threshold: 1.5
+frontend_lk_max_error: 45.0
+frontend_track_min_eigen: 1.0e-4
+frontend_ransac: 1
+frontend_ransac_strict: 1
+frontend_ransac_min_points: 12
+frontend_ransac_min_inliers: 8
+frontend_ransac_min_ratio: 0.25
+frontend_quality_grid_cols: 4
+frontend_quality_grid_rows: 3
+frontend_quality_min_tracked: 30
+frontend_min_quality_points: 20
+frontend_min_lk_keep_ratio: 0.35
+frontend_min_coverage_ratio: 0.35
+frontend_quality_min_eigen: 1.0e-4
+
+# Disable blind-mode bridging for isolation.
+blind_enable: 0
+blind_enter_track_num: 20
+blind_exit_track_num: 70
+blind_degraded_track_num: 8
+blind_parallax_threshold: 2.0
+blind_visual_weight_degraded: 0.7
+blind_bias_acc_sigma: 0.02
+blind_bias_gyr_sigma: 0.0015
+blind_bias_relax_rate: 0.18
+blind_bias_relax_max: 2.0
+blind_bias_acc_max: 1.2
+blind_bias_gyr_max: 0.35
+blind_velocity_prior_weight: 0.5
+blind_tilt_weight: 2.0
+blind_tilt_max_acc_dev: 0.8
+blind_tilt_max_gyr: 0.08
+blind_zupt_weight: 2.0
+blind_zupt_max_acc_var: 0.05
+blind_zupt_max_gyr: 0.03
+blind_thrust_weight: 0.0
+blind_thrust_hover_acc: 9.805
+blind_thrust_hover_throttle: 0.35
+blind_thrust_min_dt: 0.02
+
+# optimization parameters
+max_solver_time: 0.04
+max_num_iterations: 8
+keyframe_parallax: 10.0
+
+# imu parameters
+acc_n: 0.1
+gyr_n: 0.01
+acc_w: 0.001
+gyr_w: 0.0001
+g_norm: 9.805
+
+# Fix camera-IMU time offset during isolation.
+estimate_td: 0
+td: -0.05
+
+# loop closure
+load_previous_pose_graph: 0
+pose_graph_save_path: "/tmp/vins_pose_graph_ablation/"
+save_image: 0

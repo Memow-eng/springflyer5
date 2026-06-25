@@ -51,6 +51,10 @@ int MIN_DIST;
 double F_THRESHOLD;
 int SHOW_TRACK;
 int FLOW_BACK;
+int FEATURE_LOG_ENABLE = 0;
+std::string FEATURE_LOG_PATH = "/tmp/vins_feature_points.csv";
+int FEATURE_LOG_PRINT_EVERY = 10;
+int FEATURE_LOG_FLUSH_EVERY = 1;
 
 int FRONTEND_ADAPTIVE_FEATURE = 1;
 int FRONTEND_GRADIENT_POINTS = 1;
@@ -184,6 +188,10 @@ void readParameters(std::string config_file)
     F_THRESHOLD = fsSettings["F_threshold"];
     SHOW_TRACK = fsSettings["show_track"];
     FLOW_BACK = fsSettings["flow_back"];
+    readOptionalParam(fsSettings, "feature_log_enable", FEATURE_LOG_ENABLE);
+    readOptionalParam(fsSettings, "feature_log_path", FEATURE_LOG_PATH);
+    readOptionalParam(fsSettings, "feature_log_print_every", FEATURE_LOG_PRINT_EVERY);
+    readOptionalParam(fsSettings, "feature_log_flush_every", FEATURE_LOG_FLUSH_EVERY);
 
     readOptionalParam(fsSettings, "blind_enable", BLIND_ENABLE);
     readOptionalParam(fsSettings, "blind_enter_track_num", BLIND_ENTER_TRACK_NUM);
@@ -350,6 +358,17 @@ void readParameters(std::string config_file)
         ESTIMATE_TD = 0;
         printf("no imu, fix extrinsic param; no time offset calibration\n");
     }
+
+    ROS_INFO_STREAM("Frontend config summary: max_cnt=" << MAX_CNT
+                    << " min_dist=" << MIN_DIST
+                    << " fb=" << FLOW_BACK
+                    << " fb_thresh=" << FRONTEND_FB_THRESHOLD
+                    << " feature_log_enable=" << FEATURE_LOG_ENABLE
+                    << " feature_log_path=" << FEATURE_LOG_PATH);
+    ROS_INFO_STREAM("Estimator config summary: estimate_extrinsic=" << ESTIMATE_EXTRINSIC
+                    << " estimate_td=" << ESTIMATE_TD
+                    << " blind_enable=" << BLIND_ENABLE
+                    << " td=" << TD);
 
     fsSettings.release();
 }

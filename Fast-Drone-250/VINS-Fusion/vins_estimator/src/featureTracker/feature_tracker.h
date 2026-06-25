@@ -32,6 +32,7 @@ using namespace Eigen;
 bool inBorder(const cv::Point2f &pt);
 void reduceVector(vector<cv::Point2f> &v, vector<uchar> status);
 void reduceVector(vector<int> &v, vector<uchar> status);
+void reduceVector(vector<double> &v, vector<uchar> status);
 
 struct FrontendQuality
 {
@@ -48,6 +49,7 @@ struct FrontendQuality
     double lk_keep_ratio;
     double mean_lk_error;
     double mean_fb_error;
+    double mean_pixel_flow;
     double mean_track_eigen;
     double coverage_ratio;
     bool low_tracking_quality;
@@ -60,7 +62,7 @@ class FeatureTracker
 {
 public:
     FeatureTracker();
-    map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> trackImage(double _cur_time, const cv::Mat &_img, const cv::Mat &_img1 = cv::Mat());
+    map<int, vector<pair<int, FeatureObservation>>> trackImage(double _cur_time, const cv::Mat &_img, const cv::Mat &_img1 = cv::Mat());
     const FrontendQuality &getLastFrontendQuality() const;
     void setMask();
     void readIntrinsicParameter(const vector<string> &calib_file);
@@ -80,6 +82,7 @@ public:
     void setPrediction(map<int, Eigen::Vector3d> &predictPts);
     void addAdaptiveCorners(int need_cnt);
     void addGradientFeatures(int need_cnt);
+    void resetTrackQuality(size_t n, double value = 1.0);
 
     double distance(cv::Point2f &pt1, cv::Point2f &pt2);
     void removeOutliers(set<int> &removePtsIds);
@@ -99,6 +102,7 @@ public:
     vector<cv::Point2f> pts_velocity, right_pts_velocity;
     vector<int> ids, ids_right;
     vector<int> track_cnt;
+    vector<double> track_quality;
     map<int, cv::Point2f> cur_un_pts_map, prev_un_pts_map;
     map<int, cv::Point2f> cur_un_right_pts_map, prev_un_right_pts_map;
     map<int, cv::Point2f> prevLeftPtsMap;

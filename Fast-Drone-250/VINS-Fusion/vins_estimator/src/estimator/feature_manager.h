@@ -28,7 +28,7 @@ using namespace Eigen;
 class FeaturePerFrame
 {
   public:
-    FeaturePerFrame(const Eigen::Matrix<double, 7, 1> &_point, double td)
+    FeaturePerFrame(const FeatureObservation &_point, double td)
     {
         point.x() = _point(0);
         point.y() = _point(1);
@@ -37,10 +37,12 @@ class FeaturePerFrame
         uv.y() = _point(4);
         velocity.x() = _point(5); 
         velocity.y() = _point(6); 
+        quality = std::max(0.05, std::min(1.0, _point(7)));
+        qualityRight = quality;
         cur_td = td;
         is_stereo = false;
     }
-    void rightObservation(const Eigen::Matrix<double, 7, 1> &_point)
+    void rightObservation(const FeatureObservation &_point)
     {
         pointRight.x() = _point(0);
         pointRight.y() = _point(1);
@@ -49,12 +51,14 @@ class FeaturePerFrame
         uvRight.y() = _point(4);
         velocityRight.x() = _point(5); 
         velocityRight.y() = _point(6); 
+        qualityRight = std::max(0.05, std::min(1.0, _point(7)));
         is_stereo = true;
     }
     double cur_td;
     Vector3d point, pointRight;
     Vector2d uv, uvRight;
     Vector2d velocity, velocityRight;
+    double quality, qualityRight;
     bool is_stereo;
 };
 
@@ -85,7 +89,7 @@ class FeatureManager
     void setRic(Matrix3d _ric[]);
     void clearState();
     int getFeatureCount();
-    bool addFeatureCheckParallax(int frame_count, const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, double td);
+    bool addFeatureCheckParallax(int frame_count, const map<int, vector<pair<int, FeatureObservation>>> &image, double td);
     vector<pair<Vector3d, Vector3d>> getCorresponding(int frame_count_l, int frame_count_r);
     //void updateDepth(const VectorXd &x);
     void setDepth(const VectorXd &x);

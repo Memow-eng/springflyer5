@@ -23,6 +23,7 @@ using namespace std;
 const double FOCAL_LENGTH = 460.0;
 const int WINDOW_SIZE = 10;
 const int NUM_OF_F = 1000;
+typedef Eigen::Matrix<double, 8, 1> FeatureObservation;
 //#define UNIT_SPHERE_ERROR
 
 extern double INIT_DEPTH;
@@ -66,6 +67,10 @@ extern int MIN_DIST;
 extern double F_THRESHOLD;
 extern int SHOW_TRACK;
 extern int FLOW_BACK;
+extern int FEATURE_LOG_ENABLE;
+extern std::string FEATURE_LOG_PATH;
+extern int FEATURE_LOG_PRINT_EVERY;
+extern int FEATURE_LOG_FLUSH_EVERY;
 
 extern int FRONTEND_ADAPTIVE_FEATURE;
 extern int FRONTEND_GRADIENT_POINTS;

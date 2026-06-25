@@ -16,9 +16,11 @@ double ProjectionTwoFrameOneCamFactor::sum_t;
 
 ProjectionTwoFrameOneCamFactor::ProjectionTwoFrameOneCamFactor(const Eigen::Vector3d &_pts_i, const Eigen::Vector3d &_pts_j, 
                                        const Eigen::Vector2d &_velocity_i, const Eigen::Vector2d &_velocity_j,
-                                       const double _td_i, const double _td_j) : 
+                                       const double _td_i, const double _td_j,
+                                       const double _sqrt_info_scale) : 
                                        pts_i(_pts_i), pts_j(_pts_j), 
-                                       td_i(_td_i), td_j(_td_j)
+                                       td_i(_td_i), td_j(_td_j),
+                                       sqrt_info_scale(_sqrt_info_scale)
 {
     velocity_i.x() = _velocity_i.x();
     velocity_i.y() = _velocity_i.y();
@@ -73,7 +75,8 @@ bool ProjectionTwoFrameOneCamFactor::Evaluate(double const *const *parameters, d
     residual = (pts_camera_j / dep_j).head<2>() - pts_j_td.head<2>();
 #endif
 
-    residual = sqrt_info * residual;
+    Eigen::Matrix2d scaled_sqrt_info = sqrt_info_scale * sqrt_info;
+    residual = scaled_sqrt_info * residual;
 
     if (jacobians)
     {
@@ -96,7 +99,7 @@ bool ProjectionTwoFrameOneCamFactor::Evaluate(double const *const *parameters, d
         reduce << 1. / dep_j, 0, -pts_camera_j(0) / (dep_j * dep_j),
             0, 1. / dep_j, -pts_camera_j(1) / (dep_j * dep_j);
 #endif
-        reduce = sqrt_info * reduce;
+        reduce = scaled_sqrt_info * reduce;
 
         if (jacobians[0])
         {
@@ -141,7 +144,7 @@ bool ProjectionTwoFrameOneCamFactor::Evaluate(double const *const *parameters, d
         {
             Eigen::Map<Eigen::Vector2d> jacobian_td(jacobians[4]);
             jacobian_td = reduce * ric.transpose() * Rj.transpose() * Ri * ric * velocity_i / inv_dep_i * -1.0  +
-                          sqrt_info * velocity_j.head(2);
+                          scaled_sqrt_info * velocity_j.head(2);
         }
     }
     sum_t += tic_toc.toc();

@@ -35,6 +35,7 @@ catkin_package()
 
 add_library(vins_lib
     src/estimator/parameters.cpp
+    src/estimator/visual_health_monitor.cpp
     src/estimator/estimator.cpp
     src/estimator/feature_manager.cpp
     src/factor/pose_local_parameterization.cpp

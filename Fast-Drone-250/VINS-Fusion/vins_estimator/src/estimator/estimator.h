@@ -23,6 +23,7 @@
 
 #include "parameters.h"
 #include "feature_manager.h"
+#include "visual_health_monitor.h"
 #include "../utility/utility.h"
 #include "../utility/tic_toc.h"
 #include "../initial/solve_5pts.h"
@@ -46,14 +47,14 @@ struct FeatureMeasurement
     }
 
     FeatureMeasurement(double _t,
-                       const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &_features,
+                       const map<int, vector<pair<int, FeatureObservation>>> &_features,
                        const FrontendQuality &_quality)
         : t(_t), features(_features), quality(_quality)
     {
     }
 
     double t;
-    map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> features;
+    map<int, vector<pair<int, FeatureObservation>>> features;
     FrontendQuality quality;
 };
 
@@ -69,10 +70,10 @@ class Estimator
     void inputIMU(double t, const Vector3d &linearAcceleration, const Vector3d &angularVelocity);
     void inputThrust(double t, double thrust_norm);
     double getThrustAcc(double t);
-    void inputFeature(double t, const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &featureFrame);
+    void inputFeature(double t, const map<int, vector<pair<int, FeatureObservation>>> &featureFrame);
     void inputImage(double t, const cv::Mat &_img, const cv::Mat &_img1 = cv::Mat());
     void processIMU(double t, double dt, const Vector3d &linear_acceleration, const Vector3d &angular_velocity);
-    void processImage(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image,
+    void processImage(const map<int, vector<pair<int, FeatureObservation>>> &image,
                       const double header,
                       const FrontendQuality &frontend_quality);
     void processMeasurements();
@@ -103,10 +104,10 @@ class Estimator
     void fastPredictIMU(double t, Eigen::Vector3d linear_acceleration, Eigen::Vector3d angular_velocity);
     bool IMUAvailable(double t);
     void initFirstIMUPose(vector<pair<double, Eigen::Vector3d>> &accVector);
-    void updateVisualHealth(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image,
+    void updateVisualHealth(const map<int, vector<pair<int, FeatureObservation>>> &image,
                             const FrontendQuality &frontend_quality,
                             double header);
-    bool shouldSkipVisualFrame(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image,
+    bool shouldSkipVisualFrame(const map<int, vector<pair<int, FeatureObservation>>> &image,
                                const FrontendQuality &frontend_quality) const;
     void enterBlind(double header);
     void exitBlind(double header);
@@ -128,13 +129,6 @@ class Estimator
     {
         MARGIN_OLD = 0,
         MARGIN_SECOND_NEW = 1
-    };
-
-    enum VisualState
-    {
-        VISUAL_HEALTHY = 0,
-        VISUAL_DEGRADED = 1,
-        VISUAL_BLIND = 2
     };
 
     std::mutex mProcess;
