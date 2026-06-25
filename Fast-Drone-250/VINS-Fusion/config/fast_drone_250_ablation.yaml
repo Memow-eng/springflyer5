@@ -70,6 +70,10 @@ frontend_min_quality: 0.002
 frontend_degraded_min_dist_ratio: 0.6
 frontend_gradient_grid: 32
 frontend_gradient_min: 0.000001
+frontend_cell_grid_rows: 6
+frontend_cell_grid_cols: 8
+frontend_cell_low_tex_pass: 1
+frontend_cell_low_quality_scale: 0.5
 frontend_fb_threshold: 1.5
 frontend_lk_max_error: 45.0
 frontend_track_min_eigen: 1.0e-4
@@ -85,6 +89,10 @@ frontend_min_quality_points: 20
 frontend_min_lk_keep_ratio: 0.35
 frontend_min_coverage_ratio: 0.35
 frontend_quality_min_eigen: 1.0e-4
+good_feature_enable: 0
+good_feature_budget: 150
+good_feature_min_scale: 0.35
+good_feature_min_track_length: 2
 
 # Disable blind-mode bridging for isolation.
 blind_enable: 0

@@ -46,6 +46,12 @@ VisualHealthSnapshot makeVisualHealthSnapshot(
     snapshot.visual_parallax = visual_parallax;
     return snapshot;
 }
+
+double safeLogDet(const Eigen::Matrix3d &info)
+{
+    const double det = std::max(1e-12, info.determinant());
+    return std::log(det);
+}
 }
 
 Estimator::Estimator(): f_manager{Rs}
@@ -261,6 +267,9 @@ void Estimator::inputIMU(double t, const Vector3d &linearAcceleration, const Vec
     gyrBuf.push(make_pair(t, angularVelocity));
     //printf("input imu with time %f \n", t);
     mBuf.unlock();
+
+    if (!std::isfinite(latest_time) || latest_time <= 0.0)
+        latest_time = t;
 
     if (solver_flag == NON_LINEAR)
     {
@@ -1138,6 +1147,101 @@ bool Estimator::failureDetection()
     return false;
 }
 
+std::vector<char> Estimator::selectGoodFeatures() const
+{
+    std::vector<char> selected;
+    if (!GOOD_FEATURE_ENABLE)
+        return selected;
+
+    int candidate_count = 0;
+    for (const auto &it_per_id : f_manager.feature)
+    {
+        const int used_num = static_cast<int>(it_per_id.feature_per_frame.size());
+        if (used_num < 4)
+            continue;
+        candidate_count++;
+    }
+    if (candidate_count <= 0)
+        return selected;
+
+    selected.assign(candidate_count, 0);
+    const int budget = std::min(candidate_count, std::max(1, GOOD_FEATURE_BUDGET));
+    if (budget >= candidate_count)
+    {
+        std::fill(selected.begin(), selected.end(), 1);
+        return selected;
+    }
+
+    struct Candidate
+    {
+        int index;
+        Eigen::Vector3d bearing;
+        double weight;
+        int track_len;
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve(candidate_count);
+
+    int feature_index = -1;
+    for (const auto &it_per_id : f_manager.feature)
+    {
+        const int used_num = static_cast<int>(it_per_id.feature_per_frame.size());
+        if (used_num < 4)
+            continue;
+        ++feature_index;
+
+        const auto &anchor = it_per_id.feature_per_frame.front();
+        Eigen::Vector3d b = anchor.point.normalized();
+        if (!b.allFinite() || b.norm() < 1e-6)
+            b = Eigen::Vector3d::UnitZ();
+        const double quality = std::max(GOOD_FEATURE_MIN_SCALE, anchor.quality);
+        const int track_len = std::max(1, used_num);
+        candidates.push_back(Candidate{feature_index, b, quality, track_len});
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate &a, const Candidate &b)
+              {
+                  if (a.track_len != b.track_len)
+                      return a.track_len > b.track_len;
+                  return a.weight > b.weight;
+              });
+
+    Eigen::Matrix3d info = 1e-6 * Eigen::Matrix3d::Identity();
+    for (int pick = 0; pick < budget; pick++)
+    {
+        double best_gain = -1e18;
+        int best_idx = -1;
+        Eigen::Matrix3d best_info = info;
+        for (size_t i = 0; i < candidates.size(); i++)
+        {
+            const Candidate &c = candidates[i];
+            if (selected[c.index])
+                continue;
+            if (c.track_len < GOOD_FEATURE_MIN_TRACK_LENGTH)
+                continue;
+
+            const Eigen::Matrix3d outer = c.weight * (c.bearing * c.bearing.transpose());
+            Eigen::Matrix3d trial = info + outer;
+            const double gain = safeLogDet(trial) - safeLogDet(info);
+            if (gain > best_gain)
+            {
+                best_gain = gain;
+                best_idx = static_cast<int>(i);
+                best_info = trial;
+            }
+        }
+
+        if (best_idx < 0)
+            break;
+
+        selected[candidates[best_idx].index] = 1;
+        info = best_info;
+    }
+
+    return selected;
+}
+
 bool Estimator::isBlind() const
 {
     return BLIND_ENABLE && visual_state == VISUAL_BLIND && blind_active;
@@ -1466,6 +1570,7 @@ void Estimator::optimization()
 
     int f_m_cnt = 0;
     int feature_index = -1;
+    const std::vector<char> good_feature_mask = selectGoodFeatures();
     const double state_visual_weight =
         isBlind() ? std::max(0.20, 0.5 * BLIND_VISUAL_WEIGHT_DEGRADED) :
         (isVisualDegraded() ? BLIND_VISUAL_WEIGHT_DEGRADED : 1.0);
@@ -1480,6 +1585,12 @@ void Estimator::optimization()
                 continue;
      
             ++feature_index;
+            const bool keep_feature =
+                good_feature_mask.empty() ||
+                (feature_index >= 0 && feature_index < static_cast<int>(good_feature_mask.size()) &&
+                 good_feature_mask[feature_index]);
+            if (!keep_feature)
+                continue;
 
             int imu_i = it_per_id.start_frame, imu_j = imu_i - 1;
             
@@ -1499,7 +1610,11 @@ void Estimator::optimization()
                     double parallax = (pts_i.head<2>() - pts_j.head<2>()).norm();
                     scores.emplace_back(parallax, idx);
                 }
-                std::sort(scores.begin(), scores.end(), [](const auto &a, const auto &b){ return a.first > b.first; });
+                std::sort(scores.begin(), scores.end(),
+                          [](const std::pair<double, int> &a, const std::pair<double, int> &b)
+                          {
+                              return a.first > b.first;
+                          });
                 // keep first (anchor) and top (max_obs-1) others
                 std::fill(keep.begin(), keep.end(), 0);
                 keep[0] = 1;
@@ -1613,6 +1728,7 @@ void Estimator::optimization()
 
         {
             int feature_index = -1;
+            const std::vector<char> good_feature_mask = selectGoodFeatures();
             for (auto &it_per_id : f_manager.feature)
             {
                 it_per_id.used_num = it_per_id.feature_per_frame.size();
@@ -1620,6 +1736,12 @@ void Estimator::optimization()
                     continue;
 
                 ++feature_index;
+                const bool keep_feature =
+                    good_feature_mask.empty() ||
+                    (feature_index >= 0 && feature_index < static_cast<int>(good_feature_mask.size()) &&
+                     good_feature_mask[feature_index]);
+                if (!keep_feature)
+                    continue;
 
                 int imu_i = it_per_id.start_frame, imu_j = imu_i - 1;
                 if (imu_i != 0)
@@ -2012,6 +2134,13 @@ void Estimator::outliersRejection(set<int> &removeIndex)
 
 void Estimator::fastPredictIMU(double t, Eigen::Vector3d linear_acceleration, Eigen::Vector3d angular_velocity)
 {
+    if (!std::isfinite(latest_time) || latest_time <= 0.0)
+    {
+        latest_time = t;
+        latest_acc_0 = linear_acceleration;
+        latest_gyr_0 = angular_velocity;
+        return;
+    }
     double dt = t - latest_time;
     if (!std::isfinite(dt) || dt <= 0.0 || dt > 0.05)
     {

@@ -95,6 +95,7 @@ public:
     cv::Mat fisheye_mask;
     cv::Mat prev_img, cur_img;
     vector<cv::Point2f> n_pts;
+    vector<double> n_pts_quality;
     vector<cv::Point2f> predict_pts;
     vector<cv::Point2f> predict_pts_debug;
     vector<cv::Point2f> prev_pts, cur_pts, cur_right_pts;

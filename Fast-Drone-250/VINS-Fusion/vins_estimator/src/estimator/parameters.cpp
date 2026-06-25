@@ -78,6 +78,15 @@ int FRONTEND_MIN_QUALITY_POINTS = 25;
 double FRONTEND_MIN_LK_KEEP_RATIO = 0.35;
 double FRONTEND_MIN_COVERAGE_RATIO = 0.25;
 double FRONTEND_QUALITY_MIN_EIGEN = 1e-6;
+int FRONTEND_CELL_GRID_ROWS = 6;
+int FRONTEND_CELL_GRID_COLS = 8;
+int FRONTEND_CELL_LOW_TEX_PASS = 1;
+double FRONTEND_CELL_LOW_QUALITY_SCALE = 0.5;
+
+int GOOD_FEATURE_ENABLE = 0;
+int GOOD_FEATURE_BUDGET = 150;
+double GOOD_FEATURE_MIN_SCALE = 0.35;
+int GOOD_FEATURE_MIN_TRACK_LENGTH = 2;
 
 int BLIND_ENABLE = 1;
 int BLIND_ENTER_TRACK_NUM = 8;
@@ -238,6 +247,14 @@ void readParameters(std::string config_file)
     readOptionalParam(fsSettings, "frontend_min_lk_keep_ratio", FRONTEND_MIN_LK_KEEP_RATIO);
     readOptionalParam(fsSettings, "frontend_min_coverage_ratio", FRONTEND_MIN_COVERAGE_RATIO);
     readOptionalParam(fsSettings, "frontend_quality_min_eigen", FRONTEND_QUALITY_MIN_EIGEN);
+    readOptionalParam(fsSettings, "frontend_cell_grid_rows", FRONTEND_CELL_GRID_ROWS);
+    readOptionalParam(fsSettings, "frontend_cell_grid_cols", FRONTEND_CELL_GRID_COLS);
+    readOptionalParam(fsSettings, "frontend_cell_low_tex_pass", FRONTEND_CELL_LOW_TEX_PASS);
+    readOptionalParam(fsSettings, "frontend_cell_low_quality_scale", FRONTEND_CELL_LOW_QUALITY_SCALE);
+    readOptionalParam(fsSettings, "good_feature_enable", GOOD_FEATURE_ENABLE);
+    readOptionalParam(fsSettings, "good_feature_budget", GOOD_FEATURE_BUDGET);
+    readOptionalParam(fsSettings, "good_feature_min_scale", GOOD_FEATURE_MIN_SCALE);
+    readOptionalParam(fsSettings, "good_feature_min_track_length", GOOD_FEATURE_MIN_TRACK_LENGTH);
 
     MULTIPLE_THREAD = fsSettings["multiple_thread"];
     readOptionalParam(fsSettings, "opencv_num_threads", OPENCV_NUM_THREADS);

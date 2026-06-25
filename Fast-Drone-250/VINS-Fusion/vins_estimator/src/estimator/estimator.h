@@ -118,6 +118,7 @@ class Estimator
     bool isLowDynamic(int frame_index) const;
     bool isGroundStatic(int frame_index) const;
     double blindDuration(double header) const;
+    std::vector<char> selectGoodFeatures() const;
 
     enum SolverFlag
     {

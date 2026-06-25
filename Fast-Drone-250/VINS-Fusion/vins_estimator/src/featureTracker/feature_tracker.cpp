@@ -227,28 +227,93 @@ void FeatureTracker::addAdaptiveCorners(int need_cnt)
     if (need_cnt <= 0)
         return;
 
-    const double qualities[3] = {0.01, FRONTEND_LOW_QUALITY, FRONTEND_MIN_QUALITY};
+    n_pts_quality.clear();
+    const int grid_rows = std::max(1, FRONTEND_CELL_GRID_ROWS);
+    const int grid_cols = std::max(1, FRONTEND_CELL_GRID_COLS);
+    const int cell_h = std::max(1, row / grid_rows);
+    const int cell_w = std::max(1, col / grid_cols);
+    const int total_cells = grid_rows * grid_cols;
+    const int per_cell = std::max(1, (need_cnt + total_cells - 1) / total_cells);
     const int base_min_dist = std::max(5, MIN_DIST);
     const int low_min_dist = std::max(5, static_cast<int>(MIN_DIST * FRONTEND_DEGRADED_MIN_DIST_RATIO));
+    const double base_quality = 0.01;
+    const double low_quality = std::max(FRONTEND_MIN_QUALITY,
+                                        FRONTEND_LOW_QUALITY * std::max(0.1, FRONTEND_CELL_LOW_QUALITY_SCALE));
 
-    for (int pass = 0; pass < 3 && static_cast<int>(n_pts.size()) < need_cnt; pass++)
+    auto appendCellCorners = [&](const cv::Rect &roi, double quality_level, int min_dist, int budget)
     {
-        const int min_dist = pass == 0 ? base_min_dist : low_min_dist;
-        vector<cv::Point2f> tmp_pts;
-        int remain = need_cnt - static_cast<int>(n_pts.size());
-        cv::goodFeaturesToTrack(cur_img, tmp_pts, remain, qualities[pass], min_dist, mask);
+        if (budget <= 0 || roi.width <= 0 || roi.height <= 0)
+            return;
 
-        for (auto &p : tmp_pts)
+        cv::Mat roi_mask = mask(roi).clone();
+        if (cv::countNonZero(roi_mask) == 0)
+            return;
+
+        vector<cv::Point2f> local_pts;
+        cv::goodFeaturesToTrack(cur_img(roi), local_pts, budget, quality_level, min_dist, roi_mask);
+        for (const auto &lp : local_pts)
         {
+            cv::Point2f p(lp.x + static_cast<float>(roi.x),
+                          lp.y + static_cast<float>(roi.y));
             if (!inBorder(p))
                 continue;
             if (mask.at<uchar>(p) == 0)
                 continue;
             n_pts.push_back(p);
+            const double norm_q = quality_level <= 0.0
+                                      ? 0.35
+                                      : std::max(0.20, std::min(0.95, 0.30 + 0.15 * std::log10(1.0 + quality_level * 1e4)));
+            n_pts_quality.push_back(norm_q);
             cv::circle(mask, p, min_dist, 0, -1);
             if (static_cast<int>(n_pts.size()) >= need_cnt)
                 break;
         }
+    };
+
+    for (int gy = 0; gy < grid_rows && static_cast<int>(n_pts.size()) < need_cnt; gy++)
+    {
+        for (int gx = 0; gx < grid_cols && static_cast<int>(n_pts.size()) < need_cnt; gx++)
+        {
+            const int x = gx * cell_w;
+            const int y = gy * cell_h;
+            cv::Rect roi(x, y, std::min(cell_w, col - x), std::min(cell_h, row - y));
+            if (roi.width <= 0 || roi.height <= 0)
+                continue;
+
+            const int before = static_cast<int>(n_pts.size());
+            const int remain = need_cnt - before;
+            appendCellCorners(roi, base_quality, base_min_dist, std::min(per_cell, remain));
+
+            if (!FRONTEND_CELL_LOW_TEX_PASS || static_cast<int>(n_pts.size()) >= need_cnt)
+                continue;
+
+            const int added = static_cast<int>(n_pts.size()) - before;
+            if (added < per_cell)
+            {
+                const int refill = std::min(per_cell - added, need_cnt - static_cast<int>(n_pts.size()));
+                appendCellCorners(roi, low_quality, low_min_dist, refill);
+            }
+        }
+    }
+
+    if (static_cast<int>(n_pts.size()) >= need_cnt)
+        return;
+
+    vector<cv::Point2f> tmp_pts;
+    cv::goodFeaturesToTrack(cur_img, tmp_pts,
+                            need_cnt - static_cast<int>(n_pts.size()),
+                            low_quality, low_min_dist, mask);
+    for (const auto &p : tmp_pts)
+    {
+        if (!inBorder(p))
+            continue;
+        if (mask.at<uchar>(p) == 0)
+            continue;
+        n_pts.push_back(p);
+        n_pts_quality.push_back(0.35);
+        cv::circle(mask, p, low_min_dist, 0, -1);
+        if (static_cast<int>(n_pts.size()) >= need_cnt)
+            break;
     }
 }
 
@@ -306,6 +371,8 @@ void FeatureTracker::addGradientFeatures(int need_cnt)
         if (mask.at<uchar>(c.pt) == 0)
             continue;
         n_pts.push_back(c.pt);
+        const double q = std::max(0.25, std::min(0.85, 0.45 + 0.10 * std::log10(1.0 + static_cast<double>(c.score) * 1e6)));
+        n_pts_quality.push_back(q);
         cv::circle(mask, c.pt, md, 0, -1);
     }
 }
@@ -328,6 +395,7 @@ map<int, vector<pair<int, FeatureObservation>>> FeatureTracker::trackImage(doubl
     col = cur_img.cols;
     cv::Mat rightImg = _img1;
     n_pts.clear();
+    n_pts_quality.clear();
     /*
     {
         cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(3.0, cv::Size(8, 8));
@@ -472,14 +540,15 @@ map<int, vector<pair<int, FeatureObservation>>> FeatureTracker::trackImage(doubl
             n_pts.clear();
         ROS_DEBUG("detect feature costs: %f ms", t_t.toc());
 
-        for (auto &p : n_pts)
+        for (size_t i = 0; i < n_pts.size(); i++)
         {
             if (static_cast<int>(cur_pts.size()) >= MAX_CNT)
                 break;
-            cur_pts.push_back(p);
+            cur_pts.push_back(n_pts[i]);
             ids.push_back(n_id++);
             track_cnt.push_back(1);
-            track_quality.push_back(0.75);
+            const double q = i < n_pts_quality.size() ? n_pts_quality[i] : 0.55;
+            track_quality.push_back(q);
         }
         last_quality.new_points = static_cast<int>(n_pts.size());
         last_quality.tracked_after_ransac = static_cast<int>(cur_pts.size());
