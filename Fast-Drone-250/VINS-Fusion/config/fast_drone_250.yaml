@@ -23,7 +23,7 @@ image_height: 480
    
 
 # Extrinsic parameter between IMU and Camera.
-estimate_extrinsic: 1  # 0  Have an accurate extrinsic parameters. We will trust the following imu^R_cam, imu^T_cam, don't change it.
+estimate_extrinsic: 1   # 0  Have an accurate extrinsic parameters. We will trust the following imu^R_cam, imu^T_cam, don't change it.
                         # 1  Have an initial guess about extrinsic parameters. We will optimize around your initial guess.
 
 body_T_cam0: !!opencv-matrix
@@ -103,14 +103,19 @@ frontend_min_quality: 0.002
 frontend_degraded_min_dist_ratio: 0.6
 frontend_gradient_grid: 32
 frontend_gradient_min: 0.000001
-frontend_cell_grid_rows: 6
-frontend_cell_grid_cols: 8
-frontend_cell_low_tex_pass: 1
-frontend_cell_low_quality_scale: 0.5
-good_feature_enable: 0
-good_feature_budget: 150
+
+# Observability-aware backend feature selection. The frontend still tracks many
+# candidates; the backend keeps long-lived, parallax-rich, well-distributed
+# tracks that improve the visual information matrix.
+good_feature_enable: 1
+good_feature_budget: 120
 good_feature_min_scale: 0.35
 good_feature_min_track_length: 2
+good_feature_min_quality: 0.35
+good_feature_new_min_quality: 0.50
+good_feature_new_min_track_length: 3
+good_feature_min_parallax: 2.0
+good_feature_max_reproj_error: 3.0
 
 #visual degradation / blind inertial MAP parameters
 blind_enable: 1
@@ -127,6 +132,8 @@ blind_bias_relax_rate: 0.18       # per second; larger means trust the lock-in b
 blind_bias_relax_max: 2.0
 blind_bias_acc_max: 1.2
 blind_bias_gyr_max: 0.35
+nominal_bias_prior_enable: 1
+nominal_acc_bias_sigma: 0.15
 blind_velocity_prior_weight: 0.5
 
 #low-dynamic gravity/ZUPT priors.  These only trigger when IMU looks ground-static.
@@ -136,6 +143,15 @@ blind_tilt_max_gyr: 0.08          # rad/s, reserved for low-dynamic gating
 blind_zupt_weight: 2.0
 blind_zupt_max_acc_var: 0.05
 blind_zupt_max_gyr: 0.03
+
+# mission-level loop closure: this route returns to the takeoff point.
+# Only active after the estimator has moved away, then sees a low-flow
+# stationary segment near the recorded start pose.
+home_loop_enable: 0
+home_loop_min_travel: 0.5
+home_loop_capture_radius: 0.6
+home_loop_gain: 0.20
+home_loop_min_static_frames: 5
 
 #thrust dynamics from px4ctrl /mavros/setpoint_raw/attitude thrust.
 blind_thrust_weight: 1.0
@@ -157,7 +173,7 @@ g_norm: 9.805         # gravity magnitude
 
 #unsynchronization parameters
 estimate_td: 1                      # online estimate time offset between camera and imu
-td: -0.05                             # initial value of time offset. unit: s. readed image clock + td = real image clock (IMU clock)
+td: -0.02                             # initial value of time offset. unit: s. readed image clock + td = real image clock (IMU clock)
 
 #loop closure parameters
 load_previous_pose_graph: 0        # load and reuse previous pose graph; load from 'pose_graph_save_path'

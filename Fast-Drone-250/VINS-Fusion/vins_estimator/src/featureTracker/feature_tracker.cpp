@@ -30,16 +30,21 @@ void logFeatureStats(double t,
                      const std::vector<int> &track_cnt,
                      int row, int col)
 {
+    if (!FEATURE_LOG_ENABLE)
+        return;
+
+    static int frame_cnt = 0;
+    frame_cnt++;
+
     // ---- CSV: 每个点一行 ----
     static std::ofstream fout;
     static bool inited = false;
     if (!inited)
     {
-        if (FEATURE_LOG_ENABLE)
-            fout.open(FEATURE_LOG_PATH.c_str(), std::ios::out | std::ios::trunc);
+        fout.open(FEATURE_LOG_PATH, std::ios::out | std::ios::trunc);
         if (fout.is_open())
             fout << "t,id,u,v,track_cnt\n";
-        else if (FEATURE_LOG_ENABLE)
+        else
             printf("[FT][WARN] cannot open %s for logging\n", FEATURE_LOG_PATH.c_str());
         inited = true;
     }
@@ -50,9 +55,7 @@ void logFeatureStats(double t,
             fout << t << "," << ids[i] << ","
                  << pts[i].x << "," << pts[i].y << ","
                  << track_cnt[i] << "\n";
-        static int flush_count = 0;
-        flush_count++;
-        if (FEATURE_LOG_FLUSH_EVERY <= 1 || flush_count % FEATURE_LOG_FLUSH_EVERY == 0)
+        if (FEATURE_LOG_FLUSH_EVERY <= 1 || frame_cnt % FEATURE_LOG_FLUSH_EVERY == 0)
             fout.flush();
     }
 
@@ -81,8 +84,6 @@ void logFeatureStats(double t,
             max_cell = std::max(max_cell, grid[r][c]);
         }
 
-    static int frame_cnt = 0;
-    frame_cnt++;
     const int print_every = std::max(1, FEATURE_LOG_PRINT_EVERY);
     if (frame_cnt % print_every == 0)
     {
@@ -113,13 +114,14 @@ FrontendQuality::FrontendQuality()
       lk_keep_ratio(1.0),
       mean_lk_error(-1.0),
       mean_fb_error(-1.0),
-      mean_pixel_flow(0.0),
       mean_track_eigen(-1.0),
+      mean_pixel_flow(0.0),
       coverage_ratio(0.0),
       low_tracking_quality(false),
       weak_texture(false),
       poor_distribution(false),
-      ransac_rejected(false)
+      ransac_rejected(false),
+      low_parallax(false)
 {
 }
 
@@ -157,26 +159,19 @@ void reduceVector(vector<int> &v, vector<uchar> status)
     v.resize(j);
 }
 
-void reduceVector(vector<double> &v, vector<uchar> status)
-{
-    int j = 0;
-    for (int i = 0; i < int(v.size()); i++)
-        if (status[i])
-            v[j++] = v[i];
-    v.resize(j);
-}
-
 FeatureTracker::FeatureTracker()
 {
     stereo_cam = 0;
     n_id = 0;
     hasPrediction = false;
+    relative_rotation_.setIdentity();
     last_quality = FrontendQuality();
 }
 
-void FeatureTracker::resetTrackQuality(size_t n, double value)
+void FeatureTracker::setRelativeRotation(const Eigen::Matrix3d &R_cur_prev_cam)
 {
-    track_quality.assign(n, value);
+    if (R_cur_prev_cam.allFinite())
+        relative_rotation_ = R_cur_prev_cam;
 }
 
 void FeatureTracker::setMask()
@@ -184,40 +179,28 @@ void FeatureTracker::setMask()
     mask = cv::Mat(row, col, CV_8UC1, cv::Scalar(255));
 
     // prefer to keep features that are tracked for long time
-    struct TrackCandidate
-    {
-        int cnt;
-        cv::Point2f pt;
-        int id;
-        double quality;
-    };
-    vector<TrackCandidate> cnt_pts_id;
+    vector<pair<int, pair<cv::Point2f, int>>> cnt_pts_id;
 
     for (unsigned int i = 0; i < cur_pts.size(); i++)
-    {
-        double quality = i < track_quality.size() ? track_quality[i] : 1.0;
-        cnt_pts_id.push_back(TrackCandidate{track_cnt[i], cur_pts[i], ids[i], quality});
-    }
+        cnt_pts_id.push_back(make_pair(track_cnt[i], make_pair(cur_pts[i], ids[i])));
 
-    sort(cnt_pts_id.begin(), cnt_pts_id.end(), [](const TrackCandidate &a, const TrackCandidate &b)
+    sort(cnt_pts_id.begin(), cnt_pts_id.end(), [](const pair<int, pair<cv::Point2f, int>> &a, const pair<int, pair<cv::Point2f, int>> &b)
          {
-            return a.cnt > b.cnt;
+            return a.first > b.first;
          });
 
     cur_pts.clear();
     ids.clear();
     track_cnt.clear();
-    track_quality.clear();
 
     for (auto &it : cnt_pts_id)
     {
-        if (mask.at<uchar>(it.pt) == 255)
+        if (mask.at<uchar>(it.second.first) == 255)
         {
-            cur_pts.push_back(it.pt);
-            ids.push_back(it.id);
-            track_cnt.push_back(it.cnt);
-            track_quality.push_back(it.quality);
-            cv::circle(mask, it.pt, MIN_DIST, 0, -1);
+            cur_pts.push_back(it.second.first);
+            ids.push_back(it.second.second);
+            track_cnt.push_back(it.first);
+            cv::circle(mask, it.second.first, MIN_DIST, 0, -1);
         }
     }
 }
@@ -227,93 +210,28 @@ void FeatureTracker::addAdaptiveCorners(int need_cnt)
     if (need_cnt <= 0)
         return;
 
-    n_pts_quality.clear();
-    const int grid_rows = std::max(1, FRONTEND_CELL_GRID_ROWS);
-    const int grid_cols = std::max(1, FRONTEND_CELL_GRID_COLS);
-    const int cell_h = std::max(1, row / grid_rows);
-    const int cell_w = std::max(1, col / grid_cols);
-    const int total_cells = grid_rows * grid_cols;
-    const int per_cell = std::max(1, (need_cnt + total_cells - 1) / total_cells);
+    const double qualities[3] = {0.01, FRONTEND_LOW_QUALITY, FRONTEND_MIN_QUALITY};
     const int base_min_dist = std::max(5, MIN_DIST);
     const int low_min_dist = std::max(5, static_cast<int>(MIN_DIST * FRONTEND_DEGRADED_MIN_DIST_RATIO));
-    const double base_quality = 0.01;
-    const double low_quality = std::max(FRONTEND_MIN_QUALITY,
-                                        FRONTEND_LOW_QUALITY * std::max(0.1, FRONTEND_CELL_LOW_QUALITY_SCALE));
 
-    auto appendCellCorners = [&](const cv::Rect &roi, double quality_level, int min_dist, int budget)
+    for (int pass = 0; pass < 3 && static_cast<int>(n_pts.size()) < need_cnt; pass++)
     {
-        if (budget <= 0 || roi.width <= 0 || roi.height <= 0)
-            return;
+        const int min_dist = pass == 0 ? base_min_dist : low_min_dist;
+        vector<cv::Point2f> tmp_pts;
+        int remain = need_cnt - static_cast<int>(n_pts.size());
+        cv::goodFeaturesToTrack(cur_img, tmp_pts, remain, qualities[pass], min_dist, mask);
 
-        cv::Mat roi_mask = mask(roi).clone();
-        if (cv::countNonZero(roi_mask) == 0)
-            return;
-
-        vector<cv::Point2f> local_pts;
-        cv::goodFeaturesToTrack(cur_img(roi), local_pts, budget, quality_level, min_dist, roi_mask);
-        for (const auto &lp : local_pts)
+        for (auto &p : tmp_pts)
         {
-            cv::Point2f p(lp.x + static_cast<float>(roi.x),
-                          lp.y + static_cast<float>(roi.y));
             if (!inBorder(p))
                 continue;
             if (mask.at<uchar>(p) == 0)
                 continue;
             n_pts.push_back(p);
-            const double norm_q = quality_level <= 0.0
-                                      ? 0.35
-                                      : std::max(0.20, std::min(0.95, 0.30 + 0.15 * std::log10(1.0 + quality_level * 1e4)));
-            n_pts_quality.push_back(norm_q);
             cv::circle(mask, p, min_dist, 0, -1);
             if (static_cast<int>(n_pts.size()) >= need_cnt)
                 break;
         }
-    };
-
-    for (int gy = 0; gy < grid_rows && static_cast<int>(n_pts.size()) < need_cnt; gy++)
-    {
-        for (int gx = 0; gx < grid_cols && static_cast<int>(n_pts.size()) < need_cnt; gx++)
-        {
-            const int x = gx * cell_w;
-            const int y = gy * cell_h;
-            cv::Rect roi(x, y, std::min(cell_w, col - x), std::min(cell_h, row - y));
-            if (roi.width <= 0 || roi.height <= 0)
-                continue;
-
-            const int before = static_cast<int>(n_pts.size());
-            const int remain = need_cnt - before;
-            appendCellCorners(roi, base_quality, base_min_dist, std::min(per_cell, remain));
-
-            if (!FRONTEND_CELL_LOW_TEX_PASS || static_cast<int>(n_pts.size()) >= need_cnt)
-                continue;
-
-            const int added = static_cast<int>(n_pts.size()) - before;
-            if (added < per_cell)
-            {
-                const int refill = std::min(per_cell - added, need_cnt - static_cast<int>(n_pts.size()));
-                appendCellCorners(roi, low_quality, low_min_dist, refill);
-            }
-        }
-    }
-
-    if (static_cast<int>(n_pts.size()) >= need_cnt)
-        return;
-
-    vector<cv::Point2f> tmp_pts;
-    cv::goodFeaturesToTrack(cur_img, tmp_pts,
-                            need_cnt - static_cast<int>(n_pts.size()),
-                            low_quality, low_min_dist, mask);
-    for (const auto &p : tmp_pts)
-    {
-        if (!inBorder(p))
-            continue;
-        if (mask.at<uchar>(p) == 0)
-            continue;
-        n_pts.push_back(p);
-        n_pts_quality.push_back(0.35);
-        cv::circle(mask, p, low_min_dist, 0, -1);
-        if (static_cast<int>(n_pts.size()) >= need_cnt)
-            break;
     }
 }
 
@@ -371,8 +289,6 @@ void FeatureTracker::addGradientFeatures(int need_cnt)
         if (mask.at<uchar>(c.pt) == 0)
             continue;
         n_pts.push_back(c.pt);
-        const double q = std::max(0.25, std::min(0.85, 0.45 + 0.10 * std::log10(1.0 + static_cast<double>(c.score) * 1e6)));
-        n_pts_quality.push_back(q);
         cv::circle(mask, c.pt, md, 0, -1);
     }
 }
@@ -394,8 +310,6 @@ map<int, vector<pair<int, FeatureObservation>>> FeatureTracker::trackImage(doubl
     row = cur_img.rows;
     col = cur_img.cols;
     cv::Mat rightImg = _img1;
-    n_pts.clear();
-    n_pts_quality.clear();
     /*
     {
         cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(3.0, cv::Size(8, 8));
@@ -411,14 +325,11 @@ map<int, vector<pair<int, FeatureObservation>>> FeatureTracker::trackImage(doubl
         TicToc t_o;
         vector<uchar> status;
         vector<float> err;
-        vector<double> quality(prev_pts.size(), 1.0);
-        bool used_prediction = false;
         last_quality.prev_points = static_cast<int>(prev_pts.size());
         if(hasPrediction)
         {
             cur_pts = predict_pts;
-            used_prediction = predict_pts.size() == prev_pts.size();
-            cv::calcOpticalFlowPyrLK(prev_img, cur_img, prev_pts, cur_pts, status, err, cv::Size(21, 21), 4, 
+            cv::calcOpticalFlowPyrLK(prev_img, cur_img, prev_pts, cur_pts, status, err, cv::Size(21, 21), 3, 
             cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.01), cv::OPTFLOW_USE_INITIAL_FLOW);
             
             int succ_num = 0;
@@ -427,31 +338,11 @@ map<int, vector<pair<int, FeatureObservation>>> FeatureTracker::trackImage(doubl
                 if (status[i])
                     succ_num++;
             }
-            const int min_succ = std::max(10, static_cast<int>(0.6 * static_cast<double>(prev_pts.size())));
-            if (succ_num < min_succ)
-            {
-                used_prediction = false;
-                cv::calcOpticalFlowPyrLK(prev_img, cur_img, prev_pts, cur_pts, status, err, cv::Size(21, 21), 3);
-            }
-        }
+            if (succ_num < 10)
+               cv::calcOpticalFlowPyrLK(prev_img, cur_img, prev_pts, cur_pts, status, err, cv::Size(21, 21), 3);
+        }   
         else
             cv::calcOpticalFlowPyrLK(prev_img, cur_img, prev_pts, cur_pts, status, err, cv::Size(21, 21), 3);
-
-        for(size_t i = 0; i < status.size() && i < quality.size(); i++)
-        {
-            if (!status[i])
-                continue;
-            const double lk_err = i < err.size() ? std::max(0.0f, err[i]) : 0.0;
-            const double track_score = std::min(1.0, 0.65 + 0.035 * static_cast<double>(track_cnt[i]));
-            double prediction_score = 1.0;
-            if (used_prediction && i < predict_pts.size())
-            {
-                const double pred_px = distance(cur_pts[i], predict_pts[i]);
-                prediction_score = std::max(0.25, 1.0 / (1.0 + pred_px / 20.0));
-            }
-            const double lk_score = std::max(0.35, 1.0 / (1.0 + lk_err / 80.0));
-            quality[i] = std::max(0.20, std::min(1.0, track_score * prediction_score * lk_score));
-        }
         // reverse check
         if(FLOW_BACK)
         {
@@ -462,12 +353,9 @@ map<int, vector<pair<int, FeatureObservation>>> FeatureTracker::trackImage(doubl
             //cv::calcOpticalFlowPyrLK(cur_img, prev_img, cur_pts, reverse_pts, reverse_status, err, cv::Size(21, 21), 3); 
             for(size_t i = 0; i < status.size(); i++)
             {
-                const double fb_err = distance(prev_pts[i], reverse_pts[i]);
-                if(status[i] && reverse_status[i] && fb_err <= FRONTEND_FB_THRESHOLD)
+                if(status[i] && reverse_status[i] && distance(prev_pts[i], reverse_pts[i]) <= 0.5)
                 {
                     status[i] = 1;
-                    if (i < quality.size())
-                        quality[i] *= std::max(0.50, 1.0 / (1.0 + fb_err));
                 }
                 else
                     status[i] = 0;
@@ -479,15 +367,18 @@ map<int, vector<pair<int, FeatureObservation>>> FeatureTracker::trackImage(doubl
                 status[i] = 0;
         int kept_cnt = 0;
         double flow_sum = 0.0;
+        int flow_cnt = 0;
+        for (int i = 0; i < int(cur_pts.size()) && i < int(prev_pts.size()) && i < int(status.size()); i++)
+        {
+            if (!status[i])
+                continue;
+            flow_sum += distance(prev_pts[i], cur_pts[i]);
+            flow_cnt++;
+        }
         for (uchar s : status)
             kept_cnt += s ? 1 : 0;
-        for(size_t i = 0; i < status.size() && i < prev_pts.size() && i < cur_pts.size(); i++)
-        {
-            if (status[i])
-                flow_sum += distance(prev_pts[i], cur_pts[i]);
-        }
         last_quality.tracked_after_lk = kept_cnt;
-        last_quality.mean_pixel_flow = kept_cnt > 0 ? flow_sum / static_cast<double>(kept_cnt) : 0.0;
+        last_quality.mean_pixel_flow = flow_cnt > 0 ? flow_sum / static_cast<double>(flow_cnt) : 0.0;
         last_quality.lk_keep_ratio = last_quality.prev_points > 0
                                          ? static_cast<double>(kept_cnt) / static_cast<double>(last_quality.prev_points)
                                          : 1.0;
@@ -498,14 +389,8 @@ map<int, vector<pair<int, FeatureObservation>>> FeatureTracker::trackImage(doubl
         reduceVector(cur_pts, status);
         reduceVector(ids, status);
         reduceVector(track_cnt, status);
-        reduceVector(quality, status);
-        track_quality = quality;
         ROS_DEBUG("temporal optical flow costs: %fms", t_o.toc());
         //printf("track cnt %d\n", (int)ids.size());
-    }
-    else
-    {
-        resetTrackQuality(0);
     }
 
     for (auto &n : track_cnt)
@@ -513,7 +398,7 @@ map<int, vector<pair<int, FeatureObservation>>> FeatureTracker::trackImage(doubl
 
     if (1)
     {
-        rejectWithF();
+        //rejectWithF();
         ROS_DEBUG("set mask begins");
         TicToc t_m;
         setMask();
@@ -540,15 +425,11 @@ map<int, vector<pair<int, FeatureObservation>>> FeatureTracker::trackImage(doubl
             n_pts.clear();
         ROS_DEBUG("detect feature costs: %f ms", t_t.toc());
 
-        for (size_t i = 0; i < n_pts.size(); i++)
+        for (auto &p : n_pts)
         {
-            if (static_cast<int>(cur_pts.size()) >= MAX_CNT)
-                break;
-            cur_pts.push_back(n_pts[i]);
+            cur_pts.push_back(p);
             ids.push_back(n_id++);
             track_cnt.push_back(1);
-            const double q = i < n_pts_quality.size() ? n_pts_quality[i] : 0.55;
-            track_quality.push_back(q);
         }
         last_quality.new_points = static_cast<int>(n_pts.size());
         last_quality.tracked_after_ransac = static_cast<int>(cur_pts.size());
@@ -677,9 +558,9 @@ map<int, vector<pair<int, FeatureObservation>>> FeatureTracker::trackImage(doubl
         double velocity_x, velocity_y;
         velocity_x = pts_velocity[i].x;
         velocity_y = pts_velocity[i].y;
-        double quality = i < track_quality.size() ? track_quality[i] : 1.0;
 
         FeatureObservation xyz_uv_velocity;
+        const double quality = 1.0;
         xyz_uv_velocity << x, y, z, p_u, p_v, velocity_x, velocity_y, quality;
         featureFrame[feature_id].emplace_back(camera_id,  xyz_uv_velocity);
     }
@@ -700,17 +581,9 @@ map<int, vector<pair<int, FeatureObservation>>> FeatureTracker::trackImage(doubl
             double velocity_x, velocity_y;
             velocity_x = right_pts_velocity[i].x;
             velocity_y = right_pts_velocity[i].y;
-            double quality = 1.0;
-            for (size_t k = 0; k < ids.size(); k++)
-            {
-                if (ids[k] == feature_id)
-                {
-                    quality = k < track_quality.size() ? track_quality[k] : 1.0;
-                    break;
-                }
-            }
 
             FeatureObservation xyz_uv_velocity;
+            const double quality = 1.0;
             xyz_uv_velocity << x, y, z, p_u, p_v, velocity_x, velocity_y, quality;
             featureFrame[feature_id].emplace_back(camera_id,  xyz_uv_velocity);
         }
@@ -759,7 +632,6 @@ void FeatureTracker::rejectWithF()
         reduceVector(cur_un_pts, status);
         reduceVector(ids, status);
         reduceVector(track_cnt, status);
-        reduceVector(track_quality, status);
         ROS_DEBUG("FM ransac: %d -> %lu: %f", size_a, cur_pts.size(), 1.0 * cur_pts.size() / size_a);
         ROS_DEBUG("FM ransac costs: %fms", t_f.toc());
     }
@@ -931,6 +803,7 @@ void FeatureTracker::setPrediction(map<int, Eigen::Vector3d> &predictPts)
 
     std::vector<cv::Point2f> tmp(prev_pts.size());
     std::vector<char> has(prev_pts.size(), 0);
+    std::vector<float> dxs, dys;
 
     for (size_t i = 0; i < ids.size() && i < prev_pts.size(); i++)
     {
@@ -940,16 +813,26 @@ void FeatureTracker::setPrediction(map<int, Eigen::Vector3d> &predictPts)
             Eigen::Vector2d uv;
             m_camera[0]->spaceToPlane(it->second, uv);
             tmp[i] = cv::Point2f(static_cast<float>(uv.x()), static_cast<float>(uv.y()));
-            if (inBorder(tmp[i]))
-            {
-                has[i] = 1;
-            }
+            has[i] = 1;
+            dxs.push_back(tmp[i].x - prev_pts[i].x);
+            dys.push_back(tmp[i].y - prev_pts[i].y);
         }
+    }
+
+    float mdx = 0.f, mdy = 0.f;
+    if (!dxs.empty())
+    {
+        size_t m = dxs.size() / 2;
+        std::nth_element(dxs.begin(), dxs.begin() + m, dxs.end());
+        mdx = dxs[m];
+        std::nth_element(dys.begin(), dys.begin() + m, dys.end());
+        mdy = dys[m];
     }
 
     for (size_t i = 0; i < prev_pts.size(); i++)
     {
-        cv::Point2f p = has[i] ? tmp[i] : prev_pts[i];
+        cv::Point2f p = has[i] ? tmp[i]
+                               : cv::Point2f(prev_pts[i].x + mdx, prev_pts[i].y + mdy);
         predict_pts.push_back(p);
         predict_pts_debug.push_back(p);
     }
@@ -972,7 +855,6 @@ void FeatureTracker::removeOutliers(set<int> &removePtsIds)
     reduceVector(prev_pts, status);
     reduceVector(ids, status);
     reduceVector(track_cnt, status);
-    reduceVector(track_quality, status);
 }
 
 

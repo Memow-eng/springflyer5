@@ -32,7 +32,6 @@ using namespace Eigen;
 bool inBorder(const cv::Point2f &pt);
 void reduceVector(vector<cv::Point2f> &v, vector<uchar> status);
 void reduceVector(vector<int> &v, vector<uchar> status);
-void reduceVector(vector<double> &v, vector<uchar> status);
 
 struct FrontendQuality
 {
@@ -49,13 +48,14 @@ struct FrontendQuality
     double lk_keep_ratio;
     double mean_lk_error;
     double mean_fb_error;
-    double mean_pixel_flow;
     double mean_track_eigen;
+    double mean_pixel_flow;
     double coverage_ratio;
     bool low_tracking_quality;
     bool weak_texture;
     bool poor_distribution;
     bool ransac_rejected;
+    bool low_parallax;
 };
 
 class FeatureTracker
@@ -64,6 +64,7 @@ public:
     FeatureTracker();
     map<int, vector<pair<int, FeatureObservation>>> trackImage(double _cur_time, const cv::Mat &_img, const cv::Mat &_img1 = cv::Mat());
     const FrontendQuality &getLastFrontendQuality() const;
+    void setRelativeRotation(const Eigen::Matrix3d &R_cur_prev_cam);
     void setMask();
     void readIntrinsicParameter(const vector<string> &calib_file);
     void showUndistortion(const string &name);
@@ -82,7 +83,6 @@ public:
     void setPrediction(map<int, Eigen::Vector3d> &predictPts);
     void addAdaptiveCorners(int need_cnt);
     void addGradientFeatures(int need_cnt);
-    void resetTrackQuality(size_t n, double value = 1.0);
 
     double distance(cv::Point2f &pt1, cv::Point2f &pt2);
     void removeOutliers(set<int> &removePtsIds);
@@ -95,7 +95,6 @@ public:
     cv::Mat fisheye_mask;
     cv::Mat prev_img, cur_img;
     vector<cv::Point2f> n_pts;
-    vector<double> n_pts_quality;
     vector<cv::Point2f> predict_pts;
     vector<cv::Point2f> predict_pts_debug;
     vector<cv::Point2f> prev_pts, cur_pts, cur_right_pts;
@@ -103,7 +102,6 @@ public:
     vector<cv::Point2f> pts_velocity, right_pts_velocity;
     vector<int> ids, ids_right;
     vector<int> track_cnt;
-    vector<double> track_quality;
     map<int, cv::Point2f> cur_un_pts_map, prev_un_pts_map;
     map<int, cv::Point2f> cur_un_right_pts_map, prev_un_right_pts_map;
     map<int, cv::Point2f> prevLeftPtsMap;
@@ -113,5 +111,6 @@ public:
     bool stereo_cam;
     int n_id;
     bool hasPrediction;
+    Eigen::Matrix3d relative_rotation_;
     FrontendQuality last_quality;
 };

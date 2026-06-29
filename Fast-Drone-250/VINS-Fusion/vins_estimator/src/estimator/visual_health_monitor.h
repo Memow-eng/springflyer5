@@ -1,17 +1,5 @@
 #pragma once
 
-#include <cstddef>
-
-/*
- * Migration map:
- *   Estimator::shouldSkipVisualFrame -> VisualHealthMonitor::shouldSkipVisualFrame
- *   Estimator::updateVisualHealth    -> VisualHealthMonitor::classify
- *   Estimator::enterBlind/exitBlind  -> still live in Estimator for blind-anchor bookkeeping
- *
- * This helper is intentionally stateless for now. It gives the visual-health
- * heuristics one narrow home before we move the state machine out of Estimator.
- */
-
 enum VisualState
 {
     VISUAL_HEALTHY = 0,
@@ -35,8 +23,13 @@ struct VisualHealthSnapshot
     bool weak_texture = false;
     bool poor_distribution = false;
     bool ransac_rejected = false;
+    bool low_parallax = false;
     int visual_track_num = 0;
     double visual_parallax = 0.0;
+    double quality_median = 1.0;
+    double quality_bad_ratio = 0.0;
+    double high_quality_long_ratio = 1.0;
+    double new_feature_ratio = 0.0;
 };
 
 class VisualHealthMonitor

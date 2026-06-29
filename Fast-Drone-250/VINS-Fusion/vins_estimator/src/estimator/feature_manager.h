@@ -55,10 +55,11 @@ class FeaturePerFrame
         is_stereo = true;
     }
     double cur_td;
+    double quality;
+    double qualityRight;
     Vector3d point, pointRight;
     Vector2d uv, uvRight;
     Vector2d velocity, velocityRight;
-    double quality, qualityRight;
     bool is_stereo;
 };
 
@@ -78,7 +79,7 @@ class FeaturePerId
     {
     }
 
-    int endFrame();
+    int endFrame() const;
 };
 
 class FeatureManager
