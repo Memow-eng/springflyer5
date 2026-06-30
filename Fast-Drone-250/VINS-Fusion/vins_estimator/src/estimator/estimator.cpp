@@ -997,7 +997,15 @@ bool Estimator::isStereoInitializationReady(double header) const
         static_cast<double>(f_manager.long_track_num) / static_cast<double>(f_manager.last_track_num) : 0.0;
     const bool not_enough_motion = motion_frames < 3;
     const bool low_parallax = f_manager.last_average_parallax < 1.0;
-    const bool violent_motion = max_gyr > 0.35 || max_acc_dev > 0.8;
+    // Use sustained IMU energy as the primary "violent motion" signal. A
+    // single gyro/acceleration peak during UAV takeoff should not veto an
+    // otherwise well-constrained initialization window.
+    const bool violent_gyr_rms = gyr_rms > 0.45;
+    const bool violent_gyr_spike = max_gyr > 1.8;
+    const bool violent_acc_sustained = max_acc_dev > 6.0 && acc_excitation_rms > 2.0;
+    const bool violent_preint = preint_motion > 0.05;
+    const bool violent_motion =
+        violent_gyr_rms || violent_gyr_spike || violent_acc_sustained || violent_preint;
     const bool excessive_parallax = f_manager.last_average_parallax > 12.0 && !violent_motion &&
                                     max_gyr < 0.12 && max_acc_dev < 0.25;
     const bool front_end_healthy = f_manager.last_track_num >= 80 &&
@@ -1018,8 +1026,9 @@ bool Estimator::isStereoInitializationReady(double header) const
     if (not_enough_motion || low_parallax || excessive_parallax ||
         violent_motion || low_acc_excitation || !enough_tracks || !enough_stereo)
     {
-        ROS_WARN("VINS stereo init gate reject at %.3f: motion_frames=%d low_parallax=%d excessive_parallax=%d violent=%d low_acc_exc=%d escape=%d retry=%d tracks=%d long=%d stereo_obs=%d valid_depth=%d par=%.2f lowdyn=%d/%d lowdyn_ratio=%.2f long_ratio=%.2f max_gyr=%.2f gyr_rms=%.3f max_acc_dev=%.2f acc_exc_rms=%.3f preint_max=%.5f preint_sum=%.5f",
+        ROS_WARN("VINS stereo init gate reject at %.3f: motion_frames=%d low_parallax=%d excessive_parallax=%d violent=%d violent_gyr_rms=%d violent_gyr_spike=%d violent_acc=%d violent_preint=%d low_acc_exc=%d escape=%d retry=%d tracks=%d long=%d stereo_obs=%d valid_depth=%d par=%.2f lowdyn=%d/%d lowdyn_ratio=%.2f long_ratio=%.2f max_gyr=%.2f gyr_rms=%.3f max_acc_dev=%.2f acc_exc_rms=%.3f preint_max=%.5f preint_sum=%.5f",
                  header, motion_frames, low_parallax, excessive_parallax, violent_motion,
+                 violent_gyr_rms, violent_gyr_spike, violent_acc_sustained, violent_preint,
                  low_acc_excitation, escape_ready, stereo_init_ready_reject_count_,
                  f_manager.last_track_num, f_manager.long_track_num,
                  stereo_obs, valid_depth, f_manager.last_average_parallax,
