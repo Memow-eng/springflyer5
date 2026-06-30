@@ -19,6 +19,12 @@ struct VisualHealthSnapshot
     double mean_track_eigen = -1.0;
     double mean_pixel_flow = 0.0;
     double coverage_ratio = 0.0;
+    double brightness_mean = -1.0;
+    double dark_ratio = 0.0;
+    double saturated_ratio = 0.0;
+    double contrast_std = 0.0;
+    double blur_score = 0.0;
+    double photometric_health = 1.0;
     bool low_tracking_quality = false;
     bool weak_texture = false;
     bool poor_distribution = false;

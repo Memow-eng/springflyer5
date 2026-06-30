@@ -99,6 +99,57 @@ void logFeatureStats(double t,
         }
     }
 }
+
+double clampUnitLocal(double value)
+{
+    return std::max(0.0, std::min(1.0, value));
+}
+
+void computePhotometricQuality(const cv::Mat &img, FrontendQuality &quality)
+{
+    if (img.empty())
+        return;
+
+    cv::Mat gray;
+    if (img.channels() == 1)
+        gray = img;
+    else
+        cv::cvtColor(img, gray, cv::COLOR_BGR2GRAY);
+    if (gray.depth() != CV_8U)
+        gray.convertTo(gray, CV_8U);
+
+    cv::Scalar mean, stddev;
+    cv::meanStdDev(gray, mean, stddev);
+    quality.brightness_mean = mean[0];
+    quality.contrast_std = stddev[0];
+
+    int dark_cnt = 0;
+    int sat_cnt = 0;
+    const int total = gray.rows * gray.cols;
+    for (int r = 0; r < gray.rows; r++)
+    {
+        const uchar *ptr = gray.ptr<uchar>(r);
+        for (int c = 0; c < gray.cols; c++)
+        {
+            const uchar v = ptr[c];
+            dark_cnt += v <= 10 ? 1 : 0;
+            sat_cnt += v >= 245 ? 1 : 0;
+        }
+    }
+    quality.dark_ratio = total > 0 ? static_cast<double>(dark_cnt) / static_cast<double>(total) : 0.0;
+    quality.saturated_ratio = total > 0 ? static_cast<double>(sat_cnt) / static_cast<double>(total) : 0.0;
+
+    cv::Mat lap;
+    cv::Laplacian(gray, lap, CV_64F, 3);
+    cv::Scalar lap_mean, lap_stddev;
+    cv::meanStdDev(lap, lap_mean, lap_stddev);
+    quality.blur_score = lap_stddev[0] * lap_stddev[0];
+
+    const double exposure_health = 1.0 - std::max(quality.dark_ratio, quality.saturated_ratio);
+    const double contrast_health = clampUnitLocal(quality.contrast_std / 35.0);
+    const double blur_health = clampUnitLocal(quality.blur_score / 120.0);
+    quality.photometric_health = clampUnitLocal(0.45 * exposure_health + 0.25 * contrast_health + 0.30 * blur_health);
+}
 } // anonymous namespace
 // ===================== end FEATURE LOGGING =====================
 
@@ -117,6 +168,12 @@ FrontendQuality::FrontendQuality()
       mean_track_eigen(-1.0),
       mean_pixel_flow(0.0),
       coverage_ratio(0.0),
+      brightness_mean(-1.0),
+      dark_ratio(0.0),
+      saturated_ratio(0.0),
+      contrast_std(0.0),
+      blur_score(0.0),
+      photometric_health(1.0),
       low_tracking_quality(false),
       weak_texture(false),
       poor_distribution(false),
@@ -307,6 +364,7 @@ map<int, vector<pair<int, FeatureObservation>>> FeatureTracker::trackImage(doubl
     last_quality = FrontendQuality();
     cur_time = _cur_time;
     cur_img = _img;
+    computePhotometricQuality(cur_img, last_quality);
     row = cur_img.rows;
     col = cur_img.cols;
     cv::Mat rightImg = _img1;
@@ -319,6 +377,7 @@ map<int, vector<pair<int, FeatureObservation>>> FeatureTracker::trackImage(doubl
     }
     */
     cur_pts.clear();
+    n_pts.clear();
 
     if (prev_pts.size() > 0)
     {
@@ -398,7 +457,7 @@ map<int, vector<pair<int, FeatureObservation>>> FeatureTracker::trackImage(doubl
 
     if (1)
     {
-        //rejectWithF();
+        rejectWithF();
         ROS_DEBUG("set mask begins");
         TicToc t_m;
         setMask();
@@ -629,7 +688,6 @@ void FeatureTracker::rejectWithF()
         int size_a = cur_pts.size();
         reduceVector(prev_pts, status);
         reduceVector(cur_pts, status);
-        reduceVector(cur_un_pts, status);
         reduceVector(ids, status);
         reduceVector(track_cnt, status);
         ROS_DEBUG("FM ransac: %d -> %lu: %f", size_a, cur_pts.size(), 1.0 * cur_pts.size() / size_a);

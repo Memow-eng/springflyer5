@@ -85,6 +85,12 @@ class Estimator
     bool initialStructure();
     bool visualInitialAlign();
     bool relativePose(Matrix3d &relative_R, Vector3d &relative_T, int &l);
+    bool isStereoInitializationReady(double header) const;
+    bool isStereoInitializationSane(double header) const;
+    void logStereoInitializationGateStats(double header, const char *tag) const;
+    void logStereoInitializationQuality(double header) const;
+    void resetInitializationCandidate(double header);
+    void slideInitializationCandidate(double header);
     void slideWindow();
     void slideWindowNew();
     void slideWindowOld();
@@ -252,6 +258,7 @@ class Estimator
     int bias_failure_count_ = 0;
     int little_feature_count_ = 0;
     int nonlinear_frame_count_ = 0;
+    int stereo_init_ready_reject_count_ = 0;
     int home_loop_static_count_;
     double home_loop_max_radius_;
     double nonlinear_start_time_;

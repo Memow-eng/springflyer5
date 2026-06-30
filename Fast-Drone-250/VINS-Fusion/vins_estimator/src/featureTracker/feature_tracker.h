@@ -51,6 +51,12 @@ struct FrontendQuality
     double mean_track_eigen;
     double mean_pixel_flow;
     double coverage_ratio;
+    double brightness_mean;
+    double dark_ratio;
+    double saturated_ratio;
+    double contrast_std;
+    double blur_score;
+    double photometric_health;
     bool low_tracking_quality;
     bool weak_texture;
     bool poor_distribution;

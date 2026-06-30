@@ -62,6 +62,12 @@ VisualHealthSnapshot makeVisualHealthSnapshot(
     snapshot.mean_track_eigen = frontend_quality.mean_track_eigen;
     snapshot.mean_pixel_flow = frontend_quality.mean_pixel_flow;
     snapshot.coverage_ratio = frontend_quality.coverage_ratio;
+    snapshot.brightness_mean = frontend_quality.brightness_mean;
+    snapshot.dark_ratio = frontend_quality.dark_ratio;
+    snapshot.saturated_ratio = frontend_quality.saturated_ratio;
+    snapshot.contrast_std = frontend_quality.contrast_std;
+    snapshot.blur_score = frontend_quality.blur_score;
+    snapshot.photometric_health = frontend_quality.photometric_health;
     snapshot.low_tracking_quality = frontend_quality.low_tracking_quality;
     snapshot.weak_texture = frontend_quality.weak_texture;
     snapshot.poor_distribution = frontend_quality.poor_distribution;
@@ -159,6 +165,7 @@ void Estimator::clearState()
     bias_failure_count_ = 0;
     little_feature_count_ = 0;
     nonlinear_frame_count_ = 0;
+    stereo_init_ready_reject_count_ = 0;
     home_loop_static_count_ = 0;
     home_loop_max_radius_ = 0.0;
     nonlinear_start_time_ = -1.0;
@@ -357,6 +364,11 @@ void Estimator::inputIMU(double t, const Vector3d &linearAcceleration, const Vec
     {
         mPropagate.lock();
         fastPredictIMU(t, linearAcceleration, angularVelocity);
+        if (isLowFlowStationary() && low_flow_lock_active_ && low_flow_lock_P_.allFinite())
+        {
+            latest_P = low_flow_lock_P_;
+            latest_V.setZero();
+        }
         if (allowImuPropagateOutput())
             pubLatestOdometry(latest_P, latest_Q, latest_V, t);
         mPropagate.unlock();
@@ -703,7 +715,19 @@ void Estimator::processImage(const map<int, vector<pair<int, FeatureObservation>
                     frame_it->second.T = Ps[i];
                     i++;
                 }
-                solveGyroscopeBias(all_image_frame, Bgs);
+                if (!isStereoInitializationReady(header))
+                {
+                    ++stereo_init_ready_reject_count_;
+                    ROS_WARN("VINS stereo init ready gate slide retry %d at %.3f",
+                             stereo_init_ready_reject_count_, header);
+                    slideInitializationCandidate(header);
+                    return;
+                }
+                if (!solveGyroscopeBias(all_image_frame, Bgs))
+                {
+                    resetInitializationCandidate(header);
+                    return;
+                }
                 for (int i = 0; i <= WINDOW_SIZE; i++)
                 {
                     if (pre_integrations[i] != nullptr)
@@ -711,10 +735,17 @@ void Estimator::processImage(const map<int, vector<pair<int, FeatureObservation>
                 }
                 optimization();
                 updateLatestStates();
+                logStereoInitializationQuality(header);
+                if (!isStereoInitializationSane(header))
+                {
+                    resetInitializationCandidate(header);
+                    return;
+                }
                 solver_flag = NON_LINEAR;
                 nonlinear_start_time_ = header;
                 nonlinear_frame_count_ = 0;
                 bias_failure_count_ = 0;
+                stereo_init_ready_reject_count_ = 0;
                 slideWindow();
                 ROS_INFO("Initialization finish!");
             }
@@ -805,6 +836,462 @@ void Estimator::processImage(const map<int, vector<pair<int, FeatureObservation>
         last_state_valid_ = true;
         updateLatestStates();
     }  
+}
+
+void Estimator::logStereoInitializationGateStats(double header, const char *tag) const
+{
+    int stereo_obs = 0;
+    int long_tracks = 0;
+    int valid_depth = 0;
+    for (const auto &it_per_id : f_manager.feature)
+    {
+        bool has_stereo = false;
+        for (const auto &it_per_frame : it_per_id.feature_per_frame)
+        {
+            if (it_per_frame.is_stereo)
+            {
+                has_stereo = true;
+                stereo_obs++;
+            }
+        }
+        if (has_stereo && static_cast<int>(it_per_id.feature_per_frame.size()) >= 4)
+            long_tracks++;
+        if (it_per_id.estimated_depth > 0.0 && it_per_id.estimated_depth < 20.0)
+            valid_depth++;
+    }
+
+    int low_dynamic_frames = 0;
+    double max_gyr = 0.0;
+    double max_acc_dev = 0.0;
+    double sum_gyr2 = 0.0;
+    int gyr_count = 0;
+    Vector3d acc_mean = Vector3d::Zero();
+    int acc_count = 0;
+    for (int i = 0; i <= frame_count; i++)
+    {
+        if (isLowDynamic(i))
+            low_dynamic_frames++;
+
+        for (size_t k = 0; k < angular_velocity_buf[i].size(); k++)
+        {
+            max_gyr = std::max(max_gyr, angular_velocity_buf[i][k].norm());
+            sum_gyr2 += angular_velocity_buf[i][k].squaredNorm();
+            gyr_count++;
+        }
+        for (size_t k = 0; k < linear_acceleration_buf[i].size(); k++)
+        {
+            max_acc_dev = std::max(max_acc_dev, fabs(linear_acceleration_buf[i][k].norm() - G.norm()));
+            acc_mean += linear_acceleration_buf[i][k];
+            acc_count++;
+        }
+    }
+    if (acc_count > 0)
+        acc_mean /= static_cast<double>(acc_count);
+
+    double acc_excitation2 = 0.0;
+    for (int i = 0; i <= frame_count; i++)
+    {
+        for (size_t k = 0; k < linear_acceleration_buf[i].size(); k++)
+            acc_excitation2 += (linear_acceleration_buf[i][k] - acc_mean).squaredNorm();
+    }
+    const double acc_excitation_rms = acc_count > 0 ? std::sqrt(acc_excitation2 / static_cast<double>(acc_count)) : 0.0;
+    const double gyr_rms = gyr_count > 0 ? std::sqrt(sum_gyr2 / static_cast<double>(gyr_count)) : 0.0;
+    double preint_motion = 0.0;
+    double preint_motion_sum = 0.0;
+    for (int i = 1; i <= frame_count; i++)
+    {
+        if (pre_integrations[i] == nullptr)
+            continue;
+        const double alpha_norm = pre_integrations[i]->delta_p.norm();
+        preint_motion = std::max(preint_motion, alpha_norm);
+        preint_motion_sum += alpha_norm;
+    }
+
+    const int motion_frames = frame_count + 1 - low_dynamic_frames;
+    const double low_dynamic_ratio = (frame_count + 1) > 0 ?
+        static_cast<double>(low_dynamic_frames) / static_cast<double>(frame_count + 1) : 1.0;
+    const double long_track_ratio = f_manager.last_track_num > 0 ?
+        static_cast<double>(f_manager.long_track_num) / static_cast<double>(f_manager.last_track_num) : 0.0;
+
+    ROS_WARN("VINS stereo init gate stats %s at %.3f: motion_frames=%d tracks=%d long=%d stereo_obs=%d valid_depth=%d par=%.2f lowdyn=%d/%d lowdyn_ratio=%.2f long_ratio=%.2f max_gyr=%.2f gyr_rms=%.3f max_acc_dev=%.2f acc_exc_rms=%.3f preint_max=%.5f preint_sum=%.5f",
+             tag, header, motion_frames, f_manager.last_track_num, f_manager.long_track_num,
+             stereo_obs, valid_depth, f_manager.last_average_parallax,
+             low_dynamic_frames, frame_count + 1, low_dynamic_ratio, long_track_ratio,
+             max_gyr, gyr_rms, max_acc_dev, acc_excitation_rms,
+             preint_motion, preint_motion_sum);
+}
+
+bool Estimator::isStereoInitializationReady(double header) const
+{
+    int stereo_obs = 0;
+    int long_tracks = 0;
+    int valid_depth = 0;
+    for (const auto &it_per_id : f_manager.feature)
+    {
+        bool has_stereo = false;
+        for (const auto &it_per_frame : it_per_id.feature_per_frame)
+        {
+            if (it_per_frame.is_stereo)
+            {
+                has_stereo = true;
+                stereo_obs++;
+            }
+        }
+        if (has_stereo && static_cast<int>(it_per_id.feature_per_frame.size()) >= 4)
+            long_tracks++;
+        if (it_per_id.estimated_depth > 0.0 && it_per_id.estimated_depth < 20.0)
+            valid_depth++;
+    }
+
+    int low_dynamic_frames = 0;
+    double max_gyr = 0.0;
+    double max_acc_dev = 0.0;
+    double sum_gyr2 = 0.0;
+    int gyr_count = 0;
+    Vector3d acc_mean = Vector3d::Zero();
+    int acc_count = 0;
+    for (int i = 0; i <= frame_count; i++)
+    {
+        if (isLowDynamic(i))
+            low_dynamic_frames++;
+
+        for (size_t k = 0; k < angular_velocity_buf[i].size(); k++)
+        {
+            max_gyr = std::max(max_gyr, angular_velocity_buf[i][k].norm());
+            sum_gyr2 += angular_velocity_buf[i][k].squaredNorm();
+            gyr_count++;
+        }
+        for (size_t k = 0; k < linear_acceleration_buf[i].size(); k++)
+        {
+            max_acc_dev = std::max(max_acc_dev, fabs(linear_acceleration_buf[i][k].norm() - G.norm()));
+            acc_mean += linear_acceleration_buf[i][k];
+            acc_count++;
+        }
+    }
+    if (acc_count > 0)
+        acc_mean /= static_cast<double>(acc_count);
+
+    double acc_excitation2 = 0.0;
+    for (int i = 0; i <= frame_count; i++)
+    {
+        for (size_t k = 0; k < linear_acceleration_buf[i].size(); k++)
+            acc_excitation2 += (linear_acceleration_buf[i][k] - acc_mean).squaredNorm();
+    }
+    const double acc_excitation_rms = acc_count > 0 ? std::sqrt(acc_excitation2 / static_cast<double>(acc_count)) : 0.0;
+    const double gyr_rms = gyr_count > 0 ? std::sqrt(sum_gyr2 / static_cast<double>(gyr_count)) : 0.0;
+    double preint_motion = 0.0;
+    double preint_motion_sum = 0.0;
+    for (int i = 1; i <= frame_count; i++)
+    {
+        if (pre_integrations[i] == nullptr)
+            continue;
+        const double alpha_norm = pre_integrations[i]->delta_p.norm();
+        preint_motion = std::max(preint_motion, alpha_norm);
+        preint_motion_sum += alpha_norm;
+    }
+
+    const int motion_frames = frame_count + 1 - low_dynamic_frames;
+    const double low_dynamic_ratio = (frame_count + 1) > 0 ?
+        static_cast<double>(low_dynamic_frames) / static_cast<double>(frame_count + 1) : 1.0;
+    const double long_track_ratio = f_manager.last_track_num > 0 ?
+        static_cast<double>(f_manager.long_track_num) / static_cast<double>(f_manager.last_track_num) : 0.0;
+    const bool not_enough_motion = motion_frames < 3;
+    const bool low_parallax = f_manager.last_average_parallax < 1.0;
+    const bool violent_motion = max_gyr > 0.35 || max_acc_dev > 0.8;
+    const bool excessive_parallax = f_manager.last_average_parallax > 12.0 && !violent_motion &&
+                                    max_gyr < 0.12 && max_acc_dev < 0.25;
+    const bool front_end_healthy = f_manager.last_track_num >= 80 &&
+                                   f_manager.long_track_num >= 50 &&
+                                   long_tracks >= 50 &&
+                                   stereo_obs >= 80 &&
+                                   valid_depth >= 20;
+    const bool escape_ready = stereo_init_ready_reject_count_ >= 30 && front_end_healthy &&
+                              !not_enough_motion && !low_parallax && !excessive_parallax &&
+                              !violent_motion;
+    const bool low_acc_excitation = acc_excitation_rms < 0.12 && !escape_ready;
+    const bool enough_tracks = escape_ready ||
+                               (f_manager.last_track_num >= 100 &&
+                                f_manager.long_track_num >= 80 &&
+                                long_tracks >= 80);
+    const bool enough_stereo = stereo_obs >= 80 && valid_depth >= 20;
+
+    if (not_enough_motion || low_parallax || excessive_parallax ||
+        violent_motion || low_acc_excitation || !enough_tracks || !enough_stereo)
+    {
+        ROS_WARN("VINS stereo init gate reject at %.3f: motion_frames=%d low_parallax=%d excessive_parallax=%d violent=%d low_acc_exc=%d escape=%d retry=%d tracks=%d long=%d stereo_obs=%d valid_depth=%d par=%.2f lowdyn=%d/%d lowdyn_ratio=%.2f long_ratio=%.2f max_gyr=%.2f gyr_rms=%.3f max_acc_dev=%.2f acc_exc_rms=%.3f preint_max=%.5f preint_sum=%.5f",
+                 header, motion_frames, low_parallax, excessive_parallax, violent_motion,
+                 low_acc_excitation, escape_ready, stereo_init_ready_reject_count_,
+                 f_manager.last_track_num, f_manager.long_track_num,
+                 stereo_obs, valid_depth, f_manager.last_average_parallax,
+                 low_dynamic_frames, frame_count + 1, low_dynamic_ratio, long_track_ratio,
+                 max_gyr, gyr_rms, max_acc_dev, acc_excitation_rms,
+                 preint_motion, preint_motion_sum);
+        return false;
+    }
+
+    ROS_WARN("VINS stereo init gate accept at %.3f: motion_frames=%d escape=%d retry=%d tracks=%d long=%d stereo_obs=%d valid_depth=%d par=%.2f lowdyn=%d/%d lowdyn_ratio=%.2f long_ratio=%.2f max_gyr=%.2f gyr_rms=%.3f max_acc_dev=%.2f acc_exc_rms=%.3f preint_max=%.5f preint_sum=%.5f",
+             header, motion_frames, escape_ready, stereo_init_ready_reject_count_,
+             f_manager.last_track_num, f_manager.long_track_num,
+             stereo_obs, valid_depth, f_manager.last_average_parallax,
+             low_dynamic_frames, frame_count + 1, low_dynamic_ratio, long_track_ratio,
+             max_gyr, gyr_rms, max_acc_dev, acc_excitation_rms,
+             preint_motion, preint_motion_sum);
+    return true;
+}
+
+bool Estimator::isStereoInitializationSane(double header) const
+{
+    double max_speed = 0.0;
+    double max_step = 0.0;
+    double max_acc_bias = 0.0;
+    double max_gyr_bias = 0.0;
+    for (int i = 0; i <= frame_count; i++)
+    {
+        if (!Ps[i].allFinite() || !Vs[i].allFinite() || !Bas[i].allFinite() ||
+            !Bgs[i].allFinite() || !Rs[i].allFinite())
+        {
+            ROS_WARN("VINS stereo init sanity reject at %.3f: non-finite state at frame %d", header, i);
+            return false;
+        }
+
+        max_speed = std::max(max_speed, Vs[i].norm());
+        max_acc_bias = std::max(max_acc_bias, Bas[i].norm());
+        max_gyr_bias = std::max(max_gyr_bias, Bgs[i].norm());
+        if (i > 0)
+            max_step = std::max(max_step, (Ps[i] - Ps[i - 1]).norm());
+    }
+
+    const double window_motion = (Ps[frame_count] - Ps[0]).norm();
+    if (max_speed > 8.0 || max_step > 2.0 || max_acc_bias > 1.5 || max_gyr_bias > 0.3)
+    {
+        ROS_WARN("VINS stereo init sanity reject at %.3f: max_speed=%.3f max_step=%.3f window_motion=%.3f ba=%.3f bg=%.3f",
+                 header, max_speed, max_step, window_motion, max_acc_bias, max_gyr_bias);
+        return false;
+    }
+
+    ROS_WARN("VINS stereo init sanity accept at %.3f: max_speed=%.3f max_step=%.3f window_motion=%.3f ba=%.3f bg=%.3f",
+             header, max_speed, max_step, window_motion, max_acc_bias, max_gyr_bias);
+    return true;
+}
+
+void Estimator::logStereoInitializationQuality(double header) const
+{
+    std::vector<double> reproj_errors;
+    int valid_landmarks = 0;
+    int visual_obs = 0;
+    int stereo_obs = 0;
+    for (const auto &it_per_id : f_manager.feature)
+    {
+        if (it_per_id.estimated_depth <= 0.0 || it_per_id.estimated_depth > 20.0 ||
+            it_per_id.feature_per_frame.empty())
+            continue;
+
+        valid_landmarks++;
+        const int imu_i = it_per_id.start_frame;
+        if (imu_i < 0 || imu_i > frame_count)
+            continue;
+
+        const Vector3d pts_i = it_per_id.feature_per_frame[0].point;
+        const double depth = it_per_id.estimated_depth;
+        int imu_j = imu_i - 1;
+        for (const auto &it_per_frame : it_per_id.feature_per_frame)
+        {
+            imu_j++;
+            if (imu_j < 0 || imu_j > frame_count)
+                continue;
+
+            if (imu_i != imu_j)
+            {
+                const double err = reprojectionError(Rs[imu_i], Ps[imu_i], ric[0], tic[0],
+                                                     Rs[imu_j], Ps[imu_j], ric[0], tic[0],
+                                                     depth, pts_i, it_per_frame.point);
+                if (std::isfinite(err))
+                {
+                    reproj_errors.push_back(err * FOCAL_LENGTH);
+                    visual_obs++;
+                }
+            }
+
+            if (it_per_frame.is_stereo)
+            {
+                const double err = reprojectionError(Rs[imu_i], Ps[imu_i], ric[0], tic[0],
+                                                     Rs[imu_j], Ps[imu_j], ric[1], tic[1],
+                                                     depth, pts_i, it_per_frame.pointRight);
+                if (std::isfinite(err))
+                {
+                    reproj_errors.push_back(err * FOCAL_LENGTH);
+                    stereo_obs++;
+                }
+            }
+        }
+    }
+
+    std::vector<double> imu_rot_res;
+    std::vector<double> imu_vel_res;
+    std::vector<double> imu_pos_res;
+    for (int i = 0; i < frame_count; i++)
+    {
+        const int j = i + 1;
+        if (pre_integrations[j] == nullptr || pre_integrations[j]->sum_dt <= 0.0)
+            continue;
+
+        const double dt = pre_integrations[j]->sum_dt;
+        const Matrix3d dp_dba = pre_integrations[j]->jacobian.template block<3, 3>(O_P, O_BA);
+        const Matrix3d dp_dbg = pre_integrations[j]->jacobian.template block<3, 3>(O_P, O_BG);
+        const Matrix3d dv_dba = pre_integrations[j]->jacobian.template block<3, 3>(O_V, O_BA);
+        const Matrix3d dv_dbg = pre_integrations[j]->jacobian.template block<3, 3>(O_V, O_BG);
+        const Matrix3d dq_dbg = pre_integrations[j]->jacobian.template block<3, 3>(O_R, O_BG);
+        const Vector3d dba = Bas[i] - pre_integrations[j]->linearized_ba;
+        const Vector3d dbg = Bgs[i] - pre_integrations[j]->linearized_bg;
+
+        const Quaterniond corrected_delta_q =
+            pre_integrations[j]->delta_q * Utility::deltaQ(dq_dbg * dbg);
+        const Vector3d corrected_delta_v =
+            pre_integrations[j]->delta_v + dv_dba * dba + dv_dbg * dbg;
+        const Vector3d corrected_delta_p =
+            pre_integrations[j]->delta_p + dp_dba * dba + dp_dbg * dbg;
+
+        const Quaterniond Qi(Rs[i]);
+        const Quaterniond Qj(Rs[j]);
+        const Vector3d r_theta =
+            2.0 * (corrected_delta_q.inverse() * (Qi.inverse() * Qj)).vec();
+        const Vector3d r_beta =
+            Qi.inverse() * (Vs[j] - Vs[i] - g * dt) - corrected_delta_v;
+        const Vector3d r_alpha =
+            Qi.inverse() * (Ps[j] - Ps[i] - Vs[i] * dt - 0.5 * g * dt * dt) - corrected_delta_p;
+
+        imu_rot_res.push_back(r_theta.norm());
+        imu_vel_res.push_back(r_beta.norm());
+        imu_pos_res.push_back(r_alpha.norm());
+    }
+
+    auto percentile = [](std::vector<double> values, double q) -> double {
+        if (values.empty())
+            return -1.0;
+        std::sort(values.begin(), values.end());
+        const double pos = q * static_cast<double>(values.size() - 1);
+        const size_t lo = static_cast<size_t>(std::floor(pos));
+        const size_t hi = static_cast<size_t>(std::ceil(pos));
+        if (lo == hi)
+            return values[lo];
+        return values[lo] * (static_cast<double>(hi) - pos) +
+               values[hi] * (pos - static_cast<double>(lo));
+    };
+
+    ROS_WARN("VINS stereo init quality at %.3f: reproj_med_px=%.3f reproj_p90_px=%.3f valid_landmarks=%d visual_obs=%d stereo_obs=%d imu_rot_med=%.5f imu_vel_med=%.5f imu_pos_med=%.5f",
+             header,
+             percentile(reproj_errors, 0.5), percentile(reproj_errors, 0.9),
+             valid_landmarks, visual_obs, stereo_obs,
+             percentile(imu_rot_res, 0.5),
+             percentile(imu_vel_res, 0.5),
+             percentile(imu_pos_res, 0.5));
+}
+
+void Estimator::resetInitializationCandidate(double header)
+{
+    const Matrix3d current_R = Rs[frame_count];
+    const Vector3d current_Ba = Bas[frame_count];
+    const Vector3d current_Bg = Bgs[frame_count];
+
+    for (auto &it : all_image_frame)
+    {
+        if (it.second.pre_integration != nullptr)
+        {
+            delete it.second.pre_integration;
+            it.second.pre_integration = nullptr;
+        }
+    }
+    all_image_frame.clear();
+
+    for (int i = 0; i < WINDOW_SIZE + 1; i++)
+    {
+        if (pre_integrations[i] != nullptr)
+            delete pre_integrations[i];
+        pre_integrations[i] = nullptr;
+
+        Headers[i] = 0.0;
+        Ps[i].setZero();
+        Vs[i].setZero();
+        Rs[i] = current_R;
+        Bas[i] = current_Ba;
+        Bgs[i] = current_Bg;
+        dt_buf[i].clear();
+        linear_acceleration_buf[i].clear();
+        angular_velocity_buf[i].clear();
+    }
+
+    if (tmp_pre_integration != nullptr)
+        delete tmp_pre_integration;
+    tmp_pre_integration = new IntegrationBase{acc_0, gyr_0, Bas[0], Bgs[0]};
+
+    frame_count = 0;
+    marginalization_flag = MARGIN_OLD;
+    stereo_init_ready_reject_count_ = 0;
+    initial_timestamp = header;
+    f_manager.clearState();
+
+    ROS_WARN("VINS stereo init candidate reset at %.3f", header);
+}
+
+void Estimator::slideInitializationCandidate(double header)
+{
+    if (frame_count != WINDOW_SIZE)
+    {
+        ROS_WARN("VINS stereo init candidate slide ignored at %.3f: frame_count=%d",
+                 header, frame_count);
+        return;
+    }
+
+    const double t_0 = Headers[0];
+    back_R0 = Rs[0];
+    back_P0 = Ps[0];
+
+    for (int i = 0; i < WINDOW_SIZE; i++)
+    {
+        Headers[i] = Headers[i + 1];
+        Rs[i].swap(Rs[i + 1]);
+        Ps[i].swap(Ps[i + 1]);
+        Vs[i].swap(Vs[i + 1]);
+        Bas[i].swap(Bas[i + 1]);
+        Bgs[i].swap(Bgs[i + 1]);
+        std::swap(pre_integrations[i], pre_integrations[i + 1]);
+        dt_buf[i].swap(dt_buf[i + 1]);
+        linear_acceleration_buf[i].swap(linear_acceleration_buf[i + 1]);
+        angular_velocity_buf[i].swap(angular_velocity_buf[i + 1]);
+    }
+
+    Headers[WINDOW_SIZE] = Headers[WINDOW_SIZE - 1];
+    Ps[WINDOW_SIZE] = Ps[WINDOW_SIZE - 1];
+    Rs[WINDOW_SIZE] = Rs[WINDOW_SIZE - 1];
+    Vs[WINDOW_SIZE] = Vs[WINDOW_SIZE - 1];
+    Bas[WINDOW_SIZE] = Bas[WINDOW_SIZE - 1];
+    Bgs[WINDOW_SIZE] = Bgs[WINDOW_SIZE - 1];
+
+    if (pre_integrations[WINDOW_SIZE] != nullptr)
+        delete pre_integrations[WINDOW_SIZE];
+    pre_integrations[WINDOW_SIZE] =
+        new IntegrationBase{acc_0, gyr_0, Bas[WINDOW_SIZE], Bgs[WINDOW_SIZE]};
+    dt_buf[WINDOW_SIZE].clear();
+    linear_acceleration_buf[WINDOW_SIZE].clear();
+    angular_velocity_buf[WINDOW_SIZE].clear();
+
+    for (auto it = all_image_frame.begin(); it != all_image_frame.end();)
+    {
+        if (it->first > t_0 + 1e-9)
+            break;
+        if (it->second.pre_integration != nullptr)
+        {
+            delete it->second.pre_integration;
+            it->second.pre_integration = nullptr;
+        }
+        it = all_image_frame.erase(it);
+    }
+
+    f_manager.removeBack();
+    marginalization_flag = MARGIN_OLD;
+
+    ROS_WARN("VINS stereo init candidate slide at %.3f: dropped %.3f retry=%d",
+             header, t_0, stereo_init_ready_reject_count_);
 }
 
 bool Estimator::initialStructure()
@@ -1979,6 +2466,14 @@ void Estimator::updateVisualHealth(const map<int, vector<pair<int, FeatureObserv
     snapshot.quality_bad_ratio = latest_feature_quality_metrics_[1];
     snapshot.high_quality_long_ratio = latest_feature_quality_metrics_[2];
     snapshot.new_feature_ratio = latest_feature_quality_metrics_[3];
+    ROS_INFO_THROTTLE(1.0,
+                      "VINS photometric health: photo=%.2f mean=%.1f dark=%.3f sat=%.3f contrast=%.1f blur=%.1f",
+                      snapshot.photometric_health,
+                      snapshot.brightness_mean,
+                      snapshot.dark_ratio,
+                      snapshot.saturated_ratio,
+                      snapshot.contrast_std,
+                      snapshot.blur_score);
     const VisualHealthMonitor monitor;
     VisualState target = monitor.classify(snapshot,
                                           BLIND_ENABLE,
@@ -2044,7 +2539,7 @@ void Estimator::updateVisualHealth(const map<int, vector<pair<int, FeatureObserv
             else if (old == VISUAL_BLIND && visual_state != VISUAL_BLIND)
                 exitBlind(header);
 
-            ROS_WARN("VINS visual state %d -> %d, pts=%d, tracks=%d, flow=%.1f, eig=%.3g, par=%.2f, cov=%.2f, qmed=%.2f, bad=%.2f, hq=%.2f, new=%.2f",
+            ROS_WARN("VINS visual state %d -> %d, pts=%d, tracks=%d, flow=%.1f, eig=%.3g, par=%.2f, cov=%.2f, qmed=%.2f, bad=%.2f, hq=%.2f, new=%.2f, photo=%.2f, mean=%.1f, dark=%.3f, sat=%.3f, blur=%.1f",
                      static_cast<int>(old), static_cast<int>(visual_state),
                      frontend_quality.total_points, visual_track_num,
                      frontend_quality.mean_pixel_flow,
@@ -2053,7 +2548,12 @@ void Estimator::updateVisualHealth(const map<int, vector<pair<int, FeatureObserv
                      snapshot.quality_median,
                      snapshot.quality_bad_ratio,
                      snapshot.high_quality_long_ratio,
-                     snapshot.new_feature_ratio);
+                     snapshot.new_feature_ratio,
+                     snapshot.photometric_health,
+                     snapshot.brightness_mean,
+                     snapshot.dark_ratio,
+                     snapshot.saturated_ratio,
+                     snapshot.blur_score);
         }
     }
 
@@ -2783,8 +3283,19 @@ void Estimator::slideWindow()
             {
                 map<double, ImageFrame>::iterator it_0;
                 it_0 = all_image_frame.find(t_0);
-                delete it_0->second.pre_integration;
-                all_image_frame.erase(all_image_frame.begin(), it_0);
+                if (it_0 != all_image_frame.end())
+                {
+                    if (it_0->second.pre_integration != nullptr)
+                    {
+                        delete it_0->second.pre_integration;
+                        it_0->second.pre_integration = nullptr;
+                    }
+                    all_image_frame.erase(all_image_frame.begin(), it_0);
+                }
+                else
+                {
+                    ROS_WARN("slideWindow missing image frame %.9f during marginalization", t_0);
+                }
             }
             slideWindowOld();
         }
