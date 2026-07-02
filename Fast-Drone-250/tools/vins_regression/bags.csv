@@ -1,0 +1,9 @@
+bag,expect_init,notes
+/home/jun/record/2026-06-27-17-10-48.bag,1,flight regression
+/home/jun/record/2026-06-27-17-13-59.bag,1,flight regression
+/home/jun/record/2026-06-27-17-16-27.bag,1,flight regression
+/home/jun/record/2026-06-29-16-19-34.bag,1,flight regression
+/home/jun/record/2026-06-29-16-23-14.bag,1,flight regression
+/home/jun/record/2026-06-30-18-36-17.bag,1,locked-output regression
+/home/jun/record/2026-07-01-16-43-33.bag,0,unsafe low-excitation init should be rejected
+/home/jun/record/imu_static.bag,0,static IMU only should not initialize

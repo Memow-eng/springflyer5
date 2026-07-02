@@ -8,9 +8,6 @@
  *******************************************************/
 
 #include "parameters.h"
-#include <cerrno>
-#include <sys/stat.h>
-#include <sys/types.h>
 
 double INIT_DEPTH;
 double MIN_PARALLAX;
@@ -26,7 +23,6 @@ double BIAS_ACC_THRESHOLD;
 double BIAS_GYR_THRESHOLD;
 double SOLVER_TIME;
 int NUM_ITERATIONS;
-int MARGINALIZATION_NUM_THREADS = 2;
 int ESTIMATE_EXTRINSIC;
 int ESTIMATE_TD;
 int ROLLING_SHUTTER;
@@ -40,8 +36,6 @@ int NUM_OF_CAM;
 int STEREO;
 int USE_IMU;
 int MULTIPLE_THREAD;
-int OPENCV_NUM_THREADS = 2;
-int IMAGE_SYNC_SLEEP_MS = 3;
 map<int, Eigen::Vector3d> pts_gt;
 std::string IMAGE0_TOPIC, IMAGE1_TOPIC;
 std::string FISHEYE_MASK;
@@ -51,106 +45,13 @@ int MIN_DIST;
 double F_THRESHOLD;
 int SHOW_TRACK;
 int FLOW_BACK;
-int FEATURE_LOG_ENABLE = 0;
-std::string FEATURE_LOG_PATH = "/tmp/vins_feature_points.csv";
-int FEATURE_LOG_PRINT_EVERY = 10;
-int FEATURE_LOG_FLUSH_EVERY = 1;
 
-int FRONTEND_ADAPTIVE_FEATURE = 1;
-int FRONTEND_GRADIENT_POINTS = 1;
-double FRONTEND_LOW_QUALITY = 0.006;
-double FRONTEND_MIN_QUALITY = 0.002;
-double FRONTEND_DEGRADED_MIN_DIST_RATIO = 0.6;
-int FRONTEND_GRADIENT_GRID = 32;
-double FRONTEND_GRADIENT_MIN = 1e-6;
-double FRONTEND_FB_THRESHOLD = 0.5;
-double FRONTEND_LK_MAX_ERROR = 45.0;
-double FRONTEND_TRACK_MIN_EIGEN = 1e-6;
-int FRONTEND_RANSAC = 1;
-int FRONTEND_RANSAC_STRICT = 1;
-int FRONTEND_RANSAC_MIN_POINTS = 12;
-int FRONTEND_RANSAC_MIN_INLIERS = 8;
-double FRONTEND_RANSAC_MIN_RATIO = 0.25;
-int FRONTEND_USE_ROT_RANSAC = 1;
-double FRONTEND_LOWPAR_PARALLAX = 0.020;
-double FRONTEND_LOWPAR_RESIDUAL = 0.012;
-double FRONTEND_ROT_RANSAC_THRESH = 0.004;
-int FRONTEND_ROT_RANSAC_ITERS = 200;
-double FRONTEND_LOWPAR_COND_RATIO = 0.35;
-int FRONTEND_QUALITY_GRID_COLS = 4;
-int FRONTEND_QUALITY_GRID_ROWS = 3;
-int FRONTEND_QUALITY_MIN_TRACKED = 20;
-int FRONTEND_MIN_QUALITY_POINTS = 25;
-double FRONTEND_MIN_LK_KEEP_RATIO = 0.35;
-double FRONTEND_MIN_COVERAGE_RATIO = 0.25;
-double FRONTEND_QUALITY_MIN_EIGEN = 1e-6;
-int FRONTEND_CELL_GRID_ROWS = 6;
-int FRONTEND_CELL_GRID_COLS = 8;
-int FRONTEND_CELL_LOW_TEX_PASS = 1;
-double FRONTEND_CELL_LOW_QUALITY_SCALE = 0.5;
-double STEREO_MAX_VERTICAL_DIFF = 1.5;
-double STEREO_MIN_DISPARITY = 1.0;
-double STEREO_MAX_DISPARITY = 160.0;
-
-int GOOD_FEATURE_ENABLE = 0;
-int GOOD_FEATURE_BUDGET = 150;
-double GOOD_FEATURE_MIN_SCALE = 0.35;
-int GOOD_FEATURE_MIN_TRACK_LENGTH = 2;
-double GOOD_FEATURE_MIN_QUALITY = 0.45;
-double GOOD_FEATURE_NEW_MIN_QUALITY = 0.60;
-int GOOD_FEATURE_NEW_MIN_TRACK_LENGTH = 3;
-double GOOD_FEATURE_MIN_PARALLAX = 4.0;
-double GOOD_FEATURE_MAX_REPROJ_ERROR = 2.5;
-
-double QUALITY_DEGRADED_MEDIAN = 0.65;
-double QUALITY_DEGRADED_BAD_RATIO = 0.20;
-double QUALITY_DEGRADED_HQ_LONG_RATIO = 0.05;
-double QUALITY_DEGRADED_NEW_RATIO = 0.50;
-int QUALITY_DEGRADED_DEBOUNCE = 2;
-
-int BLIND_ENABLE = 1;
-int BLIND_ENTER_TRACK_NUM = 8;
-int BLIND_EXIT_TRACK_NUM = 45;
-int BLIND_DEGRADED_TRACK_NUM = 25;
-double BLIND_PARALLAX_THRESHOLD = 1.0;
-double BLIND_BIAS_ACC_SIGMA = 0.03;
-double BLIND_BIAS_GYR_SIGMA = 0.002;
-double BLIND_BIAS_RELAX_RATE = 0.25;
-double BLIND_BIAS_RELAX_MAX = 3.0;
-double BLIND_BIAS_ACC_MAX = 2.5;
-double BLIND_BIAS_GYR_MAX = 1.0;
-int NOMINAL_BIAS_PRIOR_ENABLE = 1;
-double NOMINAL_ACC_BIAS_SIGMA = 0.25;
-double BLIND_VELOCITY_PRIOR_WEIGHT = 0.5;
-double BLIND_TILT_WEIGHT = 1.0;
-double BLIND_TILT_MAX_ACC_DEV = 0.8;
-double BLIND_TILT_MAX_GYR = 0.08;
-double BLIND_ZUPT_WEIGHT = 2.0;
-double BLIND_ZUPT_MAX_ACC_VAR = 0.05;
-double BLIND_ZUPT_MAX_GYR = 0.03;
-double BLIND_THRUST_WEIGHT = 0.0;
-double BLIND_THRUST_HOVER_ACC = 9.805;
-double BLIND_THRUST_HOVER_THROTTLE = 0.35;
-double BLIND_THRUST_MIN_DT = 0.02;
-double BLIND_VISUAL_WEIGHT_DEGRADED = 1.0;
-int LOW_FLOW_ZUPT_ENABLE = 1;
-double LOW_FLOW_ZUPT_FLOW = 0.15;
-int LOW_FLOW_ZUPT_MIN_TRACKS = 80;
-double LOW_FLOW_ZUPT_WEIGHT = 8.0;
-int LOW_FLOW_ZUPT_WINDOW = 3;
-int HOME_LOOP_ENABLE = 0;
-double HOME_LOOP_MIN_TRAVEL = 0.5;
-double HOME_LOOP_CAPTURE_RADIUS = 0.6;
-double HOME_LOOP_GAIN = 0.20;
-int HOME_LOOP_MIN_STATIC_FRAMES = 5;
-int BLIND_PTS_OK = 80;
-int BLIND_PTS_MIN = 40;
-int BLIND_PTS_BLIND = 15;
-double BLIND_FLOW_DYN = 8.0;
-double BLIND_FLOW_STATIC = 3.0;
-int FAILURE_GRACE_FRAMES = 3;
-double FAILURE_POSE_JUMP_HARD = 5.0;
-int BLIND_DEBOUNCE_FRAMES = 5;
+int BACKEND_SELECTOR_MODE = 0;
+int BACKEND_SELECTOR_WARMUP_FRAMES = 10;
+int BACKEND_LANDMARK_BUDGET = 100;
+int BACKEND_MAX_OBS_PER_FEATURE = 4;
+int BACKEND_SELECTOR_MIN_TOTAL_OBS = 250;
+int BACKEND_SELECTOR_MIN_TRACK_LEN = 8;
 
 
 template <typename T>
@@ -180,40 +81,6 @@ void readOptionalParam(cv::FileStorage &fsSettings, const std::string &name, T &
     }
 }
 
-static bool createDirectoryRecursive(const std::string &path)
-{
-    if (path.empty())
-        return false;
-
-    std::string cur;
-    size_t pos = 0;
-    if (path[0] == '/')
-    {
-        cur = "/";
-        pos = 1;
-    }
-
-    while (pos <= path.size())
-    {
-        size_t next = path.find('/', pos);
-        std::string part = path.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
-        if (!part.empty())
-        {
-            if (cur.size() > 1 && cur.back() != '/')
-                cur += "/";
-            cur += part;
-            if (mkdir(cur.c_str(), 0755) != 0 && errno != EEXIST)
-                return false;
-        }
-        if (next == std::string::npos)
-            break;
-        pos = next + 1;
-    }
-
-    struct stat info;
-    return stat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode);
-}
-
 void readParameters(std::string config_file)
 {
     FILE *fh = fopen(config_file.c_str(),"r");
@@ -237,109 +104,14 @@ void readParameters(std::string config_file)
     F_THRESHOLD = fsSettings["F_threshold"];
     SHOW_TRACK = fsSettings["show_track"];
     FLOW_BACK = fsSettings["flow_back"];
-    readOptionalParam(fsSettings, "feature_log_enable", FEATURE_LOG_ENABLE);
-    readOptionalParam(fsSettings, "feature_log_path", FEATURE_LOG_PATH);
-    readOptionalParam(fsSettings, "feature_log_print_every", FEATURE_LOG_PRINT_EVERY);
-    readOptionalParam(fsSettings, "feature_log_flush_every", FEATURE_LOG_FLUSH_EVERY);
-
-    readOptionalParam(fsSettings, "blind_enable", BLIND_ENABLE);
-    readOptionalParam(fsSettings, "blind_enter_track_num", BLIND_ENTER_TRACK_NUM);
-    readOptionalParam(fsSettings, "blind_exit_track_num", BLIND_EXIT_TRACK_NUM);
-    readOptionalParam(fsSettings, "blind_degraded_track_num", BLIND_DEGRADED_TRACK_NUM);
-    readOptionalParam(fsSettings, "blind_parallax_threshold", BLIND_PARALLAX_THRESHOLD);
-    readOptionalParam(fsSettings, "blind_bias_acc_sigma", BLIND_BIAS_ACC_SIGMA);
-    readOptionalParam(fsSettings, "blind_bias_gyr_sigma", BLIND_BIAS_GYR_SIGMA);
-    readOptionalParam(fsSettings, "blind_bias_relax_rate", BLIND_BIAS_RELAX_RATE);
-    readOptionalParam(fsSettings, "blind_bias_relax_max", BLIND_BIAS_RELAX_MAX);
-    readOptionalParam(fsSettings, "blind_bias_acc_max", BLIND_BIAS_ACC_MAX);
-    readOptionalParam(fsSettings, "blind_bias_gyr_max", BLIND_BIAS_GYR_MAX);
-    readOptionalParam(fsSettings, "nominal_bias_prior_enable", NOMINAL_BIAS_PRIOR_ENABLE);
-    readOptionalParam(fsSettings, "nominal_acc_bias_sigma", NOMINAL_ACC_BIAS_SIGMA);
-    readOptionalParam(fsSettings, "blind_velocity_prior_weight", BLIND_VELOCITY_PRIOR_WEIGHT);
-    readOptionalParam(fsSettings, "blind_tilt_weight", BLIND_TILT_WEIGHT);
-    readOptionalParam(fsSettings, "blind_tilt_max_acc_dev", BLIND_TILT_MAX_ACC_DEV);
-    readOptionalParam(fsSettings, "blind_tilt_max_gyr", BLIND_TILT_MAX_GYR);
-    readOptionalParam(fsSettings, "blind_zupt_weight", BLIND_ZUPT_WEIGHT);
-    readOptionalParam(fsSettings, "blind_zupt_max_acc_var", BLIND_ZUPT_MAX_ACC_VAR);
-    readOptionalParam(fsSettings, "blind_zupt_max_gyr", BLIND_ZUPT_MAX_GYR);
-    readOptionalParam(fsSettings, "blind_thrust_weight", BLIND_THRUST_WEIGHT);
-    readOptionalParam(fsSettings, "blind_thrust_hover_acc", BLIND_THRUST_HOVER_ACC);
-    readOptionalParam(fsSettings, "blind_thrust_hover_throttle", BLIND_THRUST_HOVER_THROTTLE);
-    readOptionalParam(fsSettings, "blind_thrust_min_dt", BLIND_THRUST_MIN_DT);
-    readOptionalParam(fsSettings, "blind_visual_weight_degraded", BLIND_VISUAL_WEIGHT_DEGRADED);
-    readOptionalParam(fsSettings, "low_flow_zupt_enable", LOW_FLOW_ZUPT_ENABLE);
-    readOptionalParam(fsSettings, "low_flow_zupt_flow", LOW_FLOW_ZUPT_FLOW);
-    readOptionalParam(fsSettings, "low_flow_zupt_min_tracks", LOW_FLOW_ZUPT_MIN_TRACKS);
-    readOptionalParam(fsSettings, "low_flow_zupt_weight", LOW_FLOW_ZUPT_WEIGHT);
-    readOptionalParam(fsSettings, "low_flow_zupt_window", LOW_FLOW_ZUPT_WINDOW);
-    readOptionalParam(fsSettings, "home_loop_enable", HOME_LOOP_ENABLE);
-    readOptionalParam(fsSettings, "home_loop_min_travel", HOME_LOOP_MIN_TRAVEL);
-    readOptionalParam(fsSettings, "home_loop_capture_radius", HOME_LOOP_CAPTURE_RADIUS);
-    readOptionalParam(fsSettings, "home_loop_gain", HOME_LOOP_GAIN);
-    readOptionalParam(fsSettings, "home_loop_min_static_frames", HOME_LOOP_MIN_STATIC_FRAMES);
-    readOptionalParam(fsSettings, "blind_pts_ok", BLIND_PTS_OK);
-    readOptionalParam(fsSettings, "blind_pts_min", BLIND_PTS_MIN);
-    readOptionalParam(fsSettings, "blind_pts_blind", BLIND_PTS_BLIND);
-    readOptionalParam(fsSettings, "blind_flow_dyn", BLIND_FLOW_DYN);
-    readOptionalParam(fsSettings, "blind_flow_static", BLIND_FLOW_STATIC);
-    readOptionalParam(fsSettings, "failure_grace_frames", FAILURE_GRACE_FRAMES);
-    readOptionalParam(fsSettings, "failure_pose_jump_hard", FAILURE_POSE_JUMP_HARD);
-    readOptionalParam(fsSettings, "blind_debounce_frames", BLIND_DEBOUNCE_FRAMES);
-    readOptionalParam(fsSettings, "frontend_adaptive_feature", FRONTEND_ADAPTIVE_FEATURE);
-    readOptionalParam(fsSettings, "frontend_gradient_points", FRONTEND_GRADIENT_POINTS);
-    readOptionalParam(fsSettings, "frontend_low_quality", FRONTEND_LOW_QUALITY);
-    readOptionalParam(fsSettings, "frontend_min_quality", FRONTEND_MIN_QUALITY);
-    readOptionalParam(fsSettings, "frontend_degraded_min_dist_ratio", FRONTEND_DEGRADED_MIN_DIST_RATIO);
-    readOptionalParam(fsSettings, "frontend_gradient_grid", FRONTEND_GRADIENT_GRID);
-    readOptionalParam(fsSettings, "frontend_gradient_min", FRONTEND_GRADIENT_MIN);
-    readOptionalParam(fsSettings, "frontend_fb_threshold", FRONTEND_FB_THRESHOLD);
-    readOptionalParam(fsSettings, "frontend_lk_max_error", FRONTEND_LK_MAX_ERROR);
-    readOptionalParam(fsSettings, "frontend_track_min_eigen", FRONTEND_TRACK_MIN_EIGEN);
-    readOptionalParam(fsSettings, "frontend_ransac", FRONTEND_RANSAC);
-    readOptionalParam(fsSettings, "frontend_ransac_strict", FRONTEND_RANSAC_STRICT);
-    readOptionalParam(fsSettings, "frontend_ransac_min_points", FRONTEND_RANSAC_MIN_POINTS);
-    readOptionalParam(fsSettings, "frontend_ransac_min_inliers", FRONTEND_RANSAC_MIN_INLIERS);
-    readOptionalParam(fsSettings, "frontend_ransac_min_ratio", FRONTEND_RANSAC_MIN_RATIO);
-    readOptionalParam(fsSettings, "use_rot_ransac", FRONTEND_USE_ROT_RANSAC);
-    readOptionalParam(fsSettings, "lowpar_parallax", FRONTEND_LOWPAR_PARALLAX);
-    readOptionalParam(fsSettings, "lowpar_residual", FRONTEND_LOWPAR_RESIDUAL);
-    readOptionalParam(fsSettings, "ransac_thresh", FRONTEND_ROT_RANSAC_THRESH);
-    readOptionalParam(fsSettings, "ransac_iters", FRONTEND_ROT_RANSAC_ITERS);
-    readOptionalParam(fsSettings, "lowpar_cond_ratio", FRONTEND_LOWPAR_COND_RATIO);
-    readOptionalParam(fsSettings, "frontend_quality_grid_cols", FRONTEND_QUALITY_GRID_COLS);
-    readOptionalParam(fsSettings, "frontend_quality_grid_rows", FRONTEND_QUALITY_GRID_ROWS);
-    readOptionalParam(fsSettings, "frontend_quality_min_tracked", FRONTEND_QUALITY_MIN_TRACKED);
-    readOptionalParam(fsSettings, "frontend_min_quality_points", FRONTEND_MIN_QUALITY_POINTS);
-    readOptionalParam(fsSettings, "frontend_min_lk_keep_ratio", FRONTEND_MIN_LK_KEEP_RATIO);
-    readOptionalParam(fsSettings, "frontend_min_coverage_ratio", FRONTEND_MIN_COVERAGE_RATIO);
-    readOptionalParam(fsSettings, "frontend_quality_min_eigen", FRONTEND_QUALITY_MIN_EIGEN);
-    readOptionalParam(fsSettings, "frontend_cell_grid_rows", FRONTEND_CELL_GRID_ROWS);
-    readOptionalParam(fsSettings, "frontend_cell_grid_cols", FRONTEND_CELL_GRID_COLS);
-    readOptionalParam(fsSettings, "frontend_cell_low_tex_pass", FRONTEND_CELL_LOW_TEX_PASS);
-    readOptionalParam(fsSettings, "frontend_cell_low_quality_scale", FRONTEND_CELL_LOW_QUALITY_SCALE);
-    readOptionalParam(fsSettings, "stereo_max_vertical_diff", STEREO_MAX_VERTICAL_DIFF);
-    readOptionalParam(fsSettings, "stereo_min_disparity", STEREO_MIN_DISPARITY);
-    readOptionalParam(fsSettings, "stereo_max_disparity", STEREO_MAX_DISPARITY);
-    readOptionalParam(fsSettings, "good_feature_enable", GOOD_FEATURE_ENABLE);
-    readOptionalParam(fsSettings, "good_feature_budget", GOOD_FEATURE_BUDGET);
-    readOptionalParam(fsSettings, "good_feature_min_scale", GOOD_FEATURE_MIN_SCALE);
-    readOptionalParam(fsSettings, "good_feature_min_track_length", GOOD_FEATURE_MIN_TRACK_LENGTH);
-    readOptionalParam(fsSettings, "good_feature_min_quality", GOOD_FEATURE_MIN_QUALITY);
-    readOptionalParam(fsSettings, "good_feature_new_min_quality", GOOD_FEATURE_NEW_MIN_QUALITY);
-    readOptionalParam(fsSettings, "good_feature_new_min_track_length", GOOD_FEATURE_NEW_MIN_TRACK_LENGTH);
-    readOptionalParam(fsSettings, "good_feature_min_parallax", GOOD_FEATURE_MIN_PARALLAX);
-    readOptionalParam(fsSettings, "good_feature_max_reproj_error", GOOD_FEATURE_MAX_REPROJ_ERROR);
-    readOptionalParam(fsSettings, "quality_degraded_median", QUALITY_DEGRADED_MEDIAN);
-    readOptionalParam(fsSettings, "quality_degraded_bad_ratio", QUALITY_DEGRADED_BAD_RATIO);
-    readOptionalParam(fsSettings, "quality_degraded_hq_long_ratio", QUALITY_DEGRADED_HQ_LONG_RATIO);
-    readOptionalParam(fsSettings, "quality_degraded_new_ratio", QUALITY_DEGRADED_NEW_RATIO);
-    readOptionalParam(fsSettings, "quality_degraded_debounce", QUALITY_DEGRADED_DEBOUNCE);
+    readOptionalParam(fsSettings, "backend_selector_mode", BACKEND_SELECTOR_MODE);
+    readOptionalParam(fsSettings, "backend_selector_warmup_frames", BACKEND_SELECTOR_WARMUP_FRAMES);
+    readOptionalParam(fsSettings, "backend_landmark_budget", BACKEND_LANDMARK_BUDGET);
+    readOptionalParam(fsSettings, "backend_max_obs_per_feature", BACKEND_MAX_OBS_PER_FEATURE);
+    readOptionalParam(fsSettings, "backend_selector_min_total_obs", BACKEND_SELECTOR_MIN_TOTAL_OBS);
+    readOptionalParam(fsSettings, "backend_selector_min_track_len", BACKEND_SELECTOR_MIN_TRACK_LEN);
 
     MULTIPLE_THREAD = fsSettings["multiple_thread"];
-    readOptionalParam(fsSettings, "opencv_num_threads", OPENCV_NUM_THREADS);
-    readOptionalParam(fsSettings, "image_sync_sleep_ms", IMAGE_SYNC_SLEEP_MS);
-    OPENCV_NUM_THREADS = std::max(0, OPENCV_NUM_THREADS);
-    IMAGE_SYNC_SLEEP_MS = std::max(1, IMAGE_SYNC_SLEEP_MS);
 
     USE_IMU = fsSettings["imu"];
     printf("USE_IMU: %d\n", USE_IMU);
@@ -356,14 +128,10 @@ void readParameters(std::string config_file)
 
     SOLVER_TIME = fsSettings["max_solver_time"];
     NUM_ITERATIONS = fsSettings["max_num_iterations"];
-    readOptionalParam(fsSettings, "marginalization_num_threads", MARGINALIZATION_NUM_THREADS);
-    MARGINALIZATION_NUM_THREADS = std::max(1, MARGINALIZATION_NUM_THREADS);
     MIN_PARALLAX = fsSettings["keyframe_parallax"];
     MIN_PARALLAX = MIN_PARALLAX / FOCAL_LENGTH;
 
     fsSettings["output_path"] >> OUTPUT_FOLDER;
-    if (!createDirectoryRecursive(OUTPUT_FOLDER))
-        ROS_WARN("Failed to create output_path: %s", OUTPUT_FOLDER.c_str());
     VINS_RESULT_PATH = OUTPUT_FOLDER + "/stamped_traj_estimate.txt";
 
     std::cout << "result path " << VINS_RESULT_PATH << std::endl;
@@ -454,17 +222,6 @@ void readParameters(std::string config_file)
         ESTIMATE_TD = 0;
         printf("no imu, fix extrinsic param; no time offset calibration\n");
     }
-
-    ROS_INFO_STREAM("Frontend config summary: max_cnt=" << MAX_CNT
-                    << " min_dist=" << MIN_DIST
-                    << " fb=" << FLOW_BACK
-                    << " fb_thresh=" << FRONTEND_FB_THRESHOLD
-                    << " feature_log_enable=" << FEATURE_LOG_ENABLE
-                    << " feature_log_path=" << FEATURE_LOG_PATH);
-    ROS_INFO_STREAM("Estimator config summary: estimate_extrinsic=" << ESTIMATE_EXTRINSIC
-                    << " estimate_td=" << ESTIMATE_TD
-                    << " blind_enable=" << BLIND_ENABLE
-                    << " td=" << TD);
 
     fsSettings.release();
 }

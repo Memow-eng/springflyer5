@@ -23,8 +23,8 @@ image_height: 480
    
 
 # Extrinsic parameter between IMU and Camera.
-estimate_extrinsic: 1   # 0  Have an accurate extrinsic parameters. We will trust the following imu^R_cam, imu^T_cam, don't change it.
-                        # 1  Have an initial guess about extrinsic parameters. We will optimize around your initial guess.
+
+estimate_extrinsic: 1
 
 body_T_cam0: !!opencv-matrix
    rows: 4
@@ -43,139 +43,44 @@ body_T_cam1: !!opencv-matrix
            -0.99996254,  0.00807174, -0.00312626, -2.9537884753658383e-02,
            -0.00803732, -0.99990863, -0.01086906, 3.8897111872464522e-02,
             0.0,         0.0,         0.0,         1.0 ]
-
-
-
-
-# body_T_cam0: !!opencv-matrix
-#    rows: 4
-#    cols: 4
-#    dt: d
-#    data: [ 5.4259564678456274e-02, -2.1193491665982661e-01,
-#        9.7577635282952857e-01, 6.1088153910496712e-02,
-#        -9.9851326059223866e-01, -6.4152484510247021e-03,
-#        5.4130518275439868e-02, 4.2423847554686707e-02,
-#        -5.2122991434224138e-03, -9.7726272603005993e-01,
-#        -2.1196791325560449e-01, -1.2298951441870995e-01, 0., 0., 0., 1. ]
-# body_T_cam1: !!opencv-matrix
-#    rows: 4
-#    cols: 4
-#    dt: d
-#    data: [ 5.6915812882892158e-02, -2.1085706024334400e-01,
-#        9.7585854015293350e-01, 6.5179907187475128e-02,
-#        -9.9836504821304783e-01, -6.8564878477639368e-03,
-#        5.6746974200852049e-02, -5.0802504669366262e-03,
-#        -5.2745379360014007e-03, -9.7749285865418389e-01,
-#        -2.1090256169528465e-01, -1.2293603224765860e-01, 0., 0., 0., 1. ]
-
-
-
-#Multiple thread support
+ 
 multiple_thread: 1
 
 #feature traker paprameters
-max_cnt: 180            # max feature number in feature tracking
-min_dist: 8            # min distance between two features 
+max_cnt: 150     # max featur  e number in feature tracking
+min_dist: 30            # min distance between two features 
 freq: 10                # frequence (Hz) of publish tracking result. At least 10Hz for good estimation. If set 0, the frequence will be same as raw image 
 F_threshold: 1.0        # ransac threshold (pixel)
-show_track: 0           # publish tracking image as topic
+show_track: 1           # publish tracking image as topic
 flow_back: 1            # perform forward and backward optical flow to improve feature tracking accuracy
 
-# onboard CPU budget. Keep defaults conservative; set backend_frame_stride=1
-# offline or on a stronger computer when chasing maximum accuracy.
-ceres_num_threads: 2
-marginalization_num_threads: 2
-opencv_num_threads: 2
-backend_frame_stride: 1
-image_sync_sleep_ms: 3
-process_sleep_ms: 3
-feature_log_enable: 1
-feature_log_path: "/tmp/vins_feature_points.csv"
-feature_log_print_every: 30
-feature_log_flush_every: 100
-
-#frontend degradation handling
-frontend_adaptive_feature: 1
-frontend_gradient_points: 1
-frontend_reject_with_f: 0
-frontend_low_quality: 0.006
-frontend_min_quality: 0.002
-frontend_degraded_min_dist_ratio: 0.6
-frontend_gradient_grid: 32
-frontend_gradient_min: 0.000001
-
-# Observability-aware backend feature selection. The frontend still tracks many
-# candidates; the backend keeps long-lived, parallax-rich, well-distributed
-# tracks that improve the visual information matrix.
-good_feature_enable: 1
-good_feature_budget: 120
-good_feature_min_scale: 0.35
-good_feature_min_track_length: 2
-good_feature_min_quality: 0.35
-good_feature_new_min_quality: 0.50
-good_feature_new_min_track_length: 3
-good_feature_min_parallax: 2.0
-good_feature_max_reproj_error: 3.0
-
-#visual degradation / blind inertial MAP parameters
-blind_enable: 1
-blind_enter_track_num: 20         # enter BLIND if tracked features fall below this
-blind_exit_track_num: 70          # leave BLIND only after enough tracks recover
-blind_degraded_track_num: 8     # DEGRADED below this; visual residuals are down-weighted
-blind_parallax_threshold: 2.0     # px; low parallax keeps the frontend in DEGRADED
-blind_visual_weight_degraded: 0.7
-
-#blind bias anchor.  Start conservative and tune from Allan/bag residuals.
-blind_bias_acc_sigma: 0.02        # m/s^2
-blind_bias_gyr_sigma: 0.0015      # rad/s
-blind_bias_relax_rate: 0.18       # per second; larger means trust the lock-in bias less over time
-blind_bias_relax_max: 2.0
-blind_bias_acc_max: 1.2
-blind_bias_gyr_max: 0.35
-nominal_bias_prior_enable: 1
-nominal_acc_bias_sigma: 0.15
-blind_velocity_prior_weight: 0.5
-
-#low-dynamic gravity/ZUPT priors.  These only trigger when IMU looks ground-static.
-blind_tilt_weight: 2.0
-blind_tilt_max_acc_dev: 0.8       # |mean(acc)| must be within this of g
-blind_tilt_max_gyr: 0.08          # rad/s, reserved for low-dynamic gating
-blind_zupt_weight: 2.0
-blind_zupt_max_acc_var: 0.05
-blind_zupt_max_gyr: 0.03
-
-# mission-level loop closure: this route returns to the takeoff point.
-# Only active after the estimator has moved away, then sees a low-flow
-# stationary segment near the recorded start pose.
-home_loop_enable: 0
-home_loop_min_travel: 0.5
-home_loop_capture_radius: 0.6
-home_loop_gain: 0.20
-home_loop_min_static_frames: 5
-
-#thrust dynamics from px4ctrl /mavros/setpoint_raw/attitude thrust.
-blind_thrust_weight: 1.0
-blind_thrust_hover_acc: 9.805
-blind_thrust_hover_throttle: 0.35
-blind_thrust_min_dt: 0.02
+# Backend observation selector.
+# 0 = off/original, 1 = log only, 2 = gate visual factors after initialization warmup.
+backend_selector_mode: 2
+backend_selector_warmup_frames: 10
+backend_landmark_budget: 100      # legacy; conservative compression mode does not drop whole landmarks
+backend_max_obs_per_feature: 4
+backend_selector_min_total_obs: 500
+backend_selector_min_track_len: 8
 
 #optimization parameters
-max_solver_time: 0.04  # max solver itration time (ms), to guarantee real time
-max_num_iterations: 8   # max solver itrations, to guarantee real time
-keyframe_parallax: 10.0 # keyframe selection threshold (pixel)
+max_solver_time: 0.04 # max solver itration time (ms), to guarantee real time
+max_num_iterations: 8  # max solver itrations, to guarantee real time
+keyframe_parallax: 10 # keyframe selection threshold (pixel)
 
 #imu parameters       The more accurate parameters you provide, the better performance
-acc_n: 0.1          # accelerometer measurement noise standard deviation. #0.2   0.04
-gyr_n: 0.01         # gyroscope measurement noise standard deviation.     #0.05  0.004
-acc_w: 0.001         # accelerometer bias random work noise standard deviation.  #0.002
-gyr_w: 0.0001       # gyroscope bias random work noise standard deviation.     #4.0e-5
-g_norm: 9.805         # gravity magnitude
+acc_n: 0.1
+gyr_n: 0.01
+acc_w: 0.001
+gyr_w: 0.0001
+g_norm: 9.805       
 
 #unsynchronization parameters
-estimate_td: 1                      # online estimate time offset between camera and imu
-td: -0.02                             # initial value of time offset. unit: s. readed image clock + td = real image clock (IMU clock)
+estimate_td: 1
+td: -0.05231527425221
+                        # initial value of time offset. unit: s. readed image clock + td = real image clock (IMU clock)
 
 #loop closure parameters
 load_previous_pose_graph: 0        # load and reuse previous pose graph; load from 'pose_graph_save_path'
-pose_graph_save_path: "/tmp/vins_pose_graph/" # save and load path
-save_image: 0                   # save image in pose graph for visualization prupose; you can close this function by setting 0 
+pose_graph_save_path: "/home/fast/savedfiles/output/pose_graph/" # save and load path
+save_image: 1                   # save image in pose graph for visualization prupose; you can close this function by setting 0 

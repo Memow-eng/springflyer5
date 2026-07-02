@@ -9,117 +9,351 @@
 
 #include "estimator.h"
 #include "../utility/visualization.h"
+#include "../factor/zero_velocity_factor.h"
 #include <algorithm>
-#include <cmath>
-#include <limits>
+#include <fstream>
+#include <iomanip>
+#include <set>
 
 namespace
 {
-constexpr double kInvDepthMin = 1.0 / 100.0;
-constexpr double kInvDepthMax = 1.0 / 0.1;
 
-double clampVisualWeight(double weight)
+enum class ObsUseReason
 {
-    return std::max(0.10, std::min(1.0, weight));
-}
+    REJECTED = 0,
+    STRUCTURAL_ANCHOR = 1,
+    MARGINALIZATION_PIN = 2,
+    BUDGET_SELECTED = 3,
+    UNCOMPRESSED_KEEP = 4
+};
 
-double clampUnit(double value)
+struct ObsDecision
 {
-    return std::max(0.0, std::min(1.0, value));
-}
+    bool use = false;
+    ObsUseReason reason = ObsUseReason::REJECTED;
+};
 
-double safeMedian(std::vector<double> values)
+struct FeatureDecision
 {
-    if (values.empty())
-        return 0.0;
-    const size_t mid = values.size() / 2;
-    std::nth_element(values.begin(), values.begin() + mid, values.end());
-    double median = values[mid];
-    if (values.size() % 2 == 0)
+    bool use_feature = false;
+    bool marg_locked = false;
+    int selected_obs = 0;
+    std::vector<ObsDecision> obs;
+};
+
+struct FrameDecision
+{
+    std::unordered_map<int, FeatureDecision> features;
+
+    const FeatureDecision *findFeature(int feature_id) const
     {
-        std::nth_element(values.begin(), values.begin() + mid - 1, values.end());
-        median = 0.5 * (median + values[mid - 1]);
+        auto it = features.find(feature_id);
+        return it == features.end() ? nullptr : &it->second;
     }
-    return median;
-}
 
-VisualHealthSnapshot makeVisualHealthSnapshot(
-    const map<int, vector<pair<int, FeatureObservation>>> &image,
-    const FrontendQuality &frontend_quality,
-    int visual_track_num,
-    double visual_parallax)
-{
-    VisualHealthSnapshot snapshot;
-    snapshot.image_points = static_cast<int>(image.size());
-    snapshot.prev_points = frontend_quality.prev_points;
-    snapshot.tracked_after_lk = frontend_quality.tracked_after_lk;
-    snapshot.tracked_after_ransac = frontend_quality.tracked_after_ransac;
-    snapshot.total_points = frontend_quality.total_points;
-    snapshot.tracked_points = frontend_quality.prev_points > 0
-                                  ? frontend_quality.tracked_after_lk
-                                  : snapshot.image_points;
-    snapshot.lk_keep_ratio = frontend_quality.lk_keep_ratio;
-    snapshot.mean_track_eigen = frontend_quality.mean_track_eigen;
-    snapshot.mean_pixel_flow = frontend_quality.mean_pixel_flow;
-    snapshot.coverage_ratio = frontend_quality.coverage_ratio;
-    snapshot.brightness_mean = frontend_quality.brightness_mean;
-    snapshot.dark_ratio = frontend_quality.dark_ratio;
-    snapshot.saturated_ratio = frontend_quality.saturated_ratio;
-    snapshot.contrast_std = frontend_quality.contrast_std;
-    snapshot.blur_score = frontend_quality.blur_score;
-    snapshot.photometric_health = frontend_quality.photometric_health;
-    snapshot.low_tracking_quality = frontend_quality.low_tracking_quality;
-    snapshot.weak_texture = frontend_quality.weak_texture;
-    snapshot.poor_distribution = frontend_quality.poor_distribution;
-    snapshot.ransac_rejected = frontend_quality.ransac_rejected;
-    snapshot.low_parallax = frontend_quality.low_parallax;
-    snapshot.visual_track_num = visual_track_num;
-    snapshot.visual_parallax = visual_parallax;
-    return snapshot;
-}
-
-double safeLogDet(const Eigen::Matrix3d &info)
-{
-    const double det = std::max(1e-12, info.determinant());
-    return std::log(det);
-}
-
-double sampleThrustAcc(const std::deque<std::pair<double, double>> &thrust_buf, double t)
-{
-    if (thrust_buf.empty())
-        return -1.0;
-
-    double best_dt = 1e9;
-    double best_thr = -1.0;
-    for (const auto &sample : thrust_buf)
+    bool useObs(int feature_id, int obs_idx) const
     {
-        const double dt = std::fabs(sample.first - t);
-        if (dt < best_dt)
+        const FeatureDecision *fd = findFeature(feature_id);
+        if (fd == nullptr)
+            return true;
+        if (obs_idx < 0 || obs_idx >= static_cast<int>(fd->obs.size()))
+            return true;
+        return fd->obs[obs_idx].use;
+    }
+};
+
+struct SelectorFrameStat
+{
+    bool shadow_enabled = false;
+    bool gate_enabled = false;
+    bool compression_frame_enabled = false;
+    bool initialized = false;
+    int mode = 0;
+    int frame_count = 0;
+    int marginalization_flag = -1;
+    int total_backend_landmarks = 0;
+    int shadow_selected_landmarks = 0;
+    int marg_locked_landmarks = 0;
+    int total_obs = 0;
+    int shadow_selected_obs = 0;
+    int would_cut_obs = 0;
+    int hard_anchor_obs = 0;
+    int hard_marg_obs = 0;
+    int marg_locked_obs = 0;
+    int noncritical_obs = 0;
+    int longtrack_obs_ge6 = 0;
+    int longtrack_obs_ge8 = 0;
+    int compression_cuttable_obs = 0;
+    int compression_candidate_landmarks = 0;
+    int track_len_4 = 0;
+    int track_len_5 = 0;
+    int track_len_6 = 0;
+    int track_len_7 = 0;
+    int track_len_8plus = 0;
+    int budget_selected_obs = 0;
+    int actual_visual_factor_added = 0;
+    int actual_visual_obs_added = 0;
+    int actual_visual_obs_shadow_cut = 0;
+    int actual_visual_two_frame_one_cam = 0;
+    int actual_visual_two_frame_two_cam = 0;
+    int actual_visual_one_frame_two_cam = 0;
+    int marg_visual_factor_added = 0;
+    int marg_visual_obs_added = 0;
+    int marg_pinned_obs = 0;
+    int long_track_ge6 = 0;
+    int long_track_ge8 = 0;
+    int max_track_len = 0;
+    double selector_time_ms = 0.0;
+    double solver_time_ms = 0.0;
+    int ceres_iterations = 0;
+    double final_cost = 0.0;
+};
+
+static bool backendSelectorCanShadow()
+{
+    return BACKEND_SELECTOR_MODE == 1 || BACKEND_SELECTOR_MODE == 2;
+}
+
+static bool backendSelectorCanGate(Estimator::SolverFlag solver_flag,
+                                   int frame_count,
+                                   int nonlinear_optimization_age)
+{
+    if (BACKEND_SELECTOR_MODE != 2)
+        return false;
+    if (solver_flag != Estimator::NON_LINEAR)
+        return false;
+    if (frame_count < WINDOW_SIZE)
+        return false;
+    return nonlinear_optimization_age >= std::max(0, BACKEND_SELECTOR_WARMUP_FRAMES);
+}
+
+static FrameDecision decideBackendSelector(const FeatureManager &f_manager,
+                                           int frame_count,
+                                           Estimator::MarginalizationFlag marginalization_flag,
+                                           SelectorFrameStat *stat)
+{
+    FrameDecision decision;
+    const int max_obs_per_feature = std::max(3, BACKEND_MAX_OBS_PER_FEATURE);
+    const int min_total_obs = std::max(0, BACKEND_SELECTOR_MIN_TOTAL_OBS);
+    const int min_track_len = std::max(4, BACKEND_SELECTOR_MIN_TRACK_LEN);
+
+    for (const auto &lm : f_manager.feature)
+    {
+        const int used_num = static_cast<int>(lm.feature_per_frame.size());
+        if (!(used_num >= 4 && lm.start_frame < WINDOW_SIZE - 2))
+            continue;
+        if (lm.solve_flag == 2 || !std::isfinite(lm.estimated_depth) || lm.estimated_depth <= 0.0)
+            continue;
+
+        stat->total_backend_landmarks++;
+        stat->total_obs += used_num;
+        stat->max_track_len = std::max(stat->max_track_len, used_num);
+        if (used_num == 4)
+            stat->track_len_4++;
+        else if (used_num == 5)
+            stat->track_len_5++;
+        else if (used_num == 6)
+            stat->track_len_6++;
+        else if (used_num == 7)
+            stat->track_len_7++;
+        else if (used_num >= 8)
+            stat->track_len_8plus++;
+        if (used_num >= 6)
         {
-            best_dt = dt;
-            best_thr = sample.second;
+            stat->long_track_ge6++;
+            stat->longtrack_obs_ge6 += used_num;
+        }
+        if (used_num >= 8)
+        {
+            stat->long_track_ge8++;
+            stat->longtrack_obs_ge8 += used_num;
+        }
+        stat->noncritical_obs += std::max(0, used_num - 1);
+        stat->hard_anchor_obs++;
+
+        if (marginalization_flag == Estimator::MARGIN_OLD && lm.start_frame == 0)
+        {
+            stat->marg_locked_landmarks++;
+            stat->marg_locked_obs += used_num;
+            stat->hard_marg_obs += std::max(0, used_num - 1);
+            stat->noncritical_obs -= std::max(0, used_num - 1);
         }
     }
-    if (best_dt > 0.1 || best_thr < 0.0)
-        return -1.0;
 
-    const double hover = std::max(1e-3, BLIND_THRUST_HOVER_THROTTLE);
-    return (BLIND_THRUST_HOVER_ACC / hover) * best_thr;
+    stat->compression_frame_enabled = stat->total_obs >= min_total_obs;
+
+    auto keep_obs = [](FeatureDecision &fd, int idx, ObsUseReason reason) {
+        if (idx < 0 || idx >= static_cast<int>(fd.obs.size()))
+            return false;
+        if (!fd.obs[idx].use)
+            fd.selected_obs++;
+        fd.obs[idx].use = true;
+        if (fd.obs[idx].reason == ObsUseReason::REJECTED ||
+            fd.obs[idx].reason == ObsUseReason::UNCOMPRESSED_KEEP)
+            fd.obs[idx].reason = reason;
+        return true;
+    };
+
+    auto keep_all_obs = [&](FeatureDecision &fd, ObsUseReason reason) {
+        for (int i = 0; i < static_cast<int>(fd.obs.size()); ++i)
+            keep_obs(fd, i, i == 0 ? ObsUseReason::STRUCTURAL_ANCHOR : reason);
+    };
+
+    for (const auto &lm : f_manager.feature)
+    {
+        const int used_num = static_cast<int>(lm.feature_per_frame.size());
+        if (!(used_num >= 4 && lm.start_frame < WINDOW_SIZE - 2))
+            continue;
+        if (lm.solve_flag == 2 || !std::isfinite(lm.estimated_depth) || lm.estimated_depth <= 0.0)
+            continue;
+
+        FeatureDecision fd;
+        fd.use_feature = true;
+        fd.obs.resize(used_num);
+        fd.marg_locked = marginalization_flag == Estimator::MARGIN_OLD && lm.start_frame == 0;
+
+        if (fd.marg_locked)
+        {
+            for (int i = 0; i < used_num; ++i)
+                keep_obs(fd, i, i == 0 ? ObsUseReason::STRUCTURAL_ANCHOR : ObsUseReason::MARGINALIZATION_PIN);
+            stat->shadow_selected_landmarks++;
+            stat->shadow_selected_obs += used_num;
+            decision.features[lm.feature_id] = fd;
+            continue;
+        }
+
+        if (!stat->compression_frame_enabled || used_num < min_track_len)
+        {
+            keep_all_obs(fd, ObsUseReason::UNCOMPRESSED_KEEP);
+            stat->shadow_selected_landmarks++;
+            stat->shadow_selected_obs += used_num;
+            decision.features[lm.feature_id] = fd;
+            continue;
+        }
+
+        stat->compression_candidate_landmarks++;
+        stat->shadow_selected_landmarks++;
+
+        keep_obs(fd, 0, ObsUseReason::STRUCTURAL_ANCHOR);
+        keep_obs(fd, 1, ObsUseReason::BUDGET_SELECTED);
+        keep_obs(fd, used_num - 1, ObsUseReason::BUDGET_SELECTED);
+
+        if (used_num > 3)
+        {
+            std::vector<std::pair<double, int>> middle;
+            const Eigen::Vector3d anchor = lm.feature_per_frame[0].point;
+            for (int i = 2; i < used_num - 1; ++i)
+                middle.push_back(std::make_pair((lm.feature_per_frame[i].point - anchor).head<2>().norm(), i));
+            std::sort(middle.begin(), middle.end(), [](const std::pair<double, int> &a,
+                                                       const std::pair<double, int> &b) {
+                if (a.first == b.first)
+                    return a.second < b.second;
+                return a.first > b.first;
+            });
+            for (const auto &item : middle)
+            {
+                if (fd.selected_obs >= max_obs_per_feature)
+                    break;
+                keep_obs(fd, item.second, ObsUseReason::BUDGET_SELECTED);
+            }
+        }
+
+        for (const auto &obs : fd.obs)
+        {
+            if (obs.use)
+            {
+                stat->shadow_selected_obs++;
+                if (obs.reason == ObsUseReason::BUDGET_SELECTED)
+                    stat->budget_selected_obs++;
+            }
+            else
+            {
+                stat->would_cut_obs++;
+                stat->compression_cuttable_obs++;
+            }
+        }
+        decision.features[lm.feature_id] = fd;
+    }
+
+    return decision;
 }
 
-bool featureReadyForOptimization(const FeaturePerId &feature)
+static void writeSelectorStat(const SelectorFrameStat &stat)
 {
-    return feature.feature_per_frame.size() >= 4 &&
-           std::isfinite(feature.estimated_depth) &&
-           feature.estimated_depth > 0.0;
+    if (!backendSelectorCanShadow())
+        return;
+
+    const std::string path = OUTPUT_FOLDER + "/backend_selector_stats.csv";
+    static bool header_written = false;
+    std::ofstream out(path.c_str(), std::ios::app);
+    if (!out.is_open())
+        return;
+    if (!header_written)
+    {
+        out << "frame_count,mode,initialized,shadow_enabled,gate_enabled,marginalization_flag,"
+               "compression_frame_enabled,"
+               "total_landmarks,selected_landmarks,marg_locked_landmarks,total_obs,selected_obs,would_cut_obs,"
+               "hard_anchor_obs,hard_marg_obs,marg_locked_obs,noncritical_obs,longtrack_obs_ge6,longtrack_obs_ge8,"
+               "compression_cuttable_obs,compression_candidate_landmarks,track_len_4,track_len_5,track_len_6,track_len_7,track_len_8plus,"
+               "budget_selected_obs,actual_visual_factor_added,actual_visual_obs_added,"
+               "actual_visual_obs_shadow_cut,actual_two_frame_one_cam,actual_two_frame_two_cam,actual_one_frame_two_cam,"
+               "marg_visual_factor_added,marg_visual_obs_added,marg_pinned_obs,long_track_ge6,long_track_ge8,max_track_len,"
+               "selector_time_ms,solver_time_ms,ceres_iterations,final_cost\n";
+        header_written = true;
+    }
+
+    out << stat.frame_count << ','
+        << stat.mode << ','
+        << stat.initialized << ','
+        << stat.shadow_enabled << ','
+        << stat.gate_enabled << ','
+        << stat.marginalization_flag << ','
+        << stat.compression_frame_enabled << ','
+        << stat.total_backend_landmarks << ','
+        << stat.shadow_selected_landmarks << ','
+        << stat.marg_locked_landmarks << ','
+        << stat.total_obs << ','
+        << stat.shadow_selected_obs << ','
+        << stat.would_cut_obs << ','
+        << stat.hard_anchor_obs << ','
+        << stat.hard_marg_obs << ','
+        << stat.marg_locked_obs << ','
+        << stat.noncritical_obs << ','
+        << stat.longtrack_obs_ge6 << ','
+        << stat.longtrack_obs_ge8 << ','
+        << stat.compression_cuttable_obs << ','
+        << stat.compression_candidate_landmarks << ','
+        << stat.track_len_4 << ','
+        << stat.track_len_5 << ','
+        << stat.track_len_6 << ','
+        << stat.track_len_7 << ','
+        << stat.track_len_8plus << ','
+        << stat.budget_selected_obs << ','
+        << stat.actual_visual_factor_added << ','
+        << stat.actual_visual_obs_added << ','
+        << stat.actual_visual_obs_shadow_cut << ','
+        << stat.actual_visual_two_frame_one_cam << ','
+        << stat.actual_visual_two_frame_two_cam << ','
+        << stat.actual_visual_one_frame_two_cam << ','
+        << stat.marg_visual_factor_added << ','
+        << stat.marg_visual_obs_added << ','
+        << stat.marg_pinned_obs << ','
+        << stat.long_track_ge6 << ','
+        << stat.long_track_ge8 << ','
+        << stat.max_track_len << ','
+        << std::fixed << std::setprecision(3)
+        << stat.selector_time_ms << ','
+        << stat.solver_time_ms << ','
+        << stat.ceres_iterations << ','
+        << std::setprecision(9) << stat.final_cost << '\n';
 }
-}
+
+} // namespace
 
 Estimator::Estimator(): f_manager{Rs}
 {
     ROS_INFO("init begins");
     initThreadFlag = false;
-    latest_estimator_latency_ms_ = 0.0;
     clearState();
 }
 
@@ -149,36 +383,6 @@ void Estimator::clearState()
     initR = Eigen::Matrix3d::Identity();
     inputImageCnt = 0;
     initFirstPoseFlag = false;
-    visual_state = VISUAL_HEALTHY;
-    pending_state_ = VISUAL_HEALTHY;
-    pending_count_ = 0;
-    visual_track_num = 0;
-    visual_parallax = 0.0;
-    blind_start_time = -1.0;
-    blind_active = false;
-    blind_anchor_valid = false;
-    low_flow_lock_active_ = false;
-    home_loop_origin_valid_ = false;
-    home_loop_active_ = false;
-    last_state_valid_ = false;
-    soft_failure_count_ = 0;
-    bias_failure_count_ = 0;
-    little_feature_count_ = 0;
-    nonlinear_frame_count_ = 0;
-    stereo_init_ready_reject_count_ = 0;
-    home_loop_static_count_ = 0;
-    home_loop_max_radius_ = 0.0;
-    nonlinear_start_time_ = -1.0;
-    low_flow_lock_P_.setZero();
-    home_loop_origin_.setZero();
-    blind_ba0.setZero();
-    blind_bg0.setZero();
-    blind_acc_body0.setZero();
-    blind_v0.setZero();
-    {
-        std::lock_guard<std::mutex> lock(mThrust);
-        thrustBuf.clear();
-    }
 
     for (int i = 0; i < WINDOW_SIZE + 1; i++)
     {
@@ -210,10 +414,6 @@ void Estimator::clearState()
     frame_count = 0;
     solver_flag = INITIAL;
     initial_timestamp = 0;
-    last_R = Matrix3d::Identity();
-    last_P = Vector3d::Zero();
-    last_R0 = Matrix3d::Identity();
-    last_P0 = Vector3d::Zero();
     all_image_frame.clear();
 
     if (tmp_pre_integration != nullptr)
@@ -228,7 +428,6 @@ void Estimator::clearState()
     f_manager.clearState();
 
     failure_occur = 0;
-    latest_feature_quality_metrics_ = {1.0, 0.0, 1.0, 0.0};
 
     mProcess.unlock();
 }
@@ -301,29 +500,17 @@ void Estimator::changeSensorType(int use_imu, int use_stereo)
 void Estimator::inputImage(double t, const cv::Mat &_img, const cv::Mat &_img1)
 {
     inputImageCnt++;
-    map<int, vector<pair<int, FeatureObservation>>> featureFrame;
-    FrontendQuality frontendQuality;
+    map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> featureFrame;
     TicToc featureTrackerTime;
 
-    {
-        std::lock_guard<std::mutex> lock(mTracker);
-        if (solver_flag == NON_LINEAR && frame_count >= 1)
-        {
-            const Eigen::Matrix3d R_cur_prev_cam =
-                ric[0].transpose() * Rs[frame_count].transpose() * Rs[frame_count - 1] * ric[0];
-            featureTracker.setRelativeRotation(R_cur_prev_cam);
-        }
-        if(_img1.empty())
-            featureFrame = featureTracker.trackImage(t, _img);
-        else
-            featureFrame = featureTracker.trackImage(t, _img, _img1);
-        frontendQuality = featureTracker.getLastFrontendQuality();
-    }
+    if(_img1.empty())
+        featureFrame = featureTracker.trackImage(t, _img);
+    else
+        featureFrame = featureTracker.trackImage(t, _img, _img1);
     //printf("featureTracker time: %f\n", featureTrackerTime.toc());
 
     if (SHOW_TRACK)
     {
-        std::lock_guard<std::mutex> lock(mTracker);
         cv::Mat imgTrack = featureTracker.getTrackImage();
         pubTrackImage(imgTrack, t);
     }
@@ -333,14 +520,14 @@ void Estimator::inputImage(double t, const cv::Mat &_img, const cv::Mat &_img1)
         if(inputImageCnt % 2 == 0)
         {
             mBuf.lock();
-            featureBuf.push(FeatureMeasurement(t, featureFrame, frontendQuality));
+            featureBuf.push(make_pair(t, featureFrame));
             mBuf.unlock();
         }
     }
     else
     {
         mBuf.lock();
-        featureBuf.push(FeatureMeasurement(t, featureFrame, frontendQuality));
+        featureBuf.push(make_pair(t, featureFrame));
         mBuf.unlock();
         TicToc processTime;
         processMeasurements();
@@ -357,65 +544,19 @@ void Estimator::inputIMU(double t, const Vector3d &linearAcceleration, const Vec
     //printf("input imu with time %f \n", t);
     mBuf.unlock();
 
-    if (!std::isfinite(latest_time) || latest_time <= 0.0)
-        latest_time = t;
-
     if (solver_flag == NON_LINEAR)
     {
         mPropagate.lock();
         fastPredictIMU(t, linearAcceleration, angularVelocity);
-        if (isLowFlowStationary() && low_flow_lock_active_ && low_flow_lock_P_.allFinite())
-        {
-            latest_P = low_flow_lock_P_;
-            latest_V.setZero();
-        }
-        if (allowImuPropagateOutput())
-            pubLatestOdometry(latest_P, latest_Q, latest_V, t);
+        pubLatestOdometry(latest_P, latest_Q, latest_V, t);
         mPropagate.unlock();
     }
 }
 
-void Estimator::inputThrust(double t, double thrust_norm)
+void Estimator::inputFeature(double t, const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &featureFrame)
 {
-    std::lock_guard<std::mutex> lock(mThrust);
-    thrustBuf.push_back(std::make_pair(t, thrust_norm));
-    while (!thrustBuf.empty() && thrustBuf.front().first < t - 2.0)
-        thrustBuf.pop_front();
-}
-
-double Estimator::getThrustAcc(double t)
-{
-    std::lock_guard<std::mutex> lock(mThrust);
-    if (thrustBuf.empty())
-        return -1.0;
-
-    double best_dt = 1e9;
-    double best_thr = -1.0;
-    for (const auto &e : thrustBuf)
-    {
-        double d = std::fabs(e.first - t);
-        if (d < best_dt)
-        {
-            best_dt = d;
-            best_thr = e.second;
-        }
-    }
-    if (best_dt > 0.1 || best_thr < 0.0)
-        return -1.0;
-
-    const double hover = std::max(1e-3, BLIND_THRUST_HOVER_THROTTLE);
-    return (BLIND_THRUST_HOVER_ACC / hover) * best_thr;
-}
-
-void Estimator::inputFeature(double t, const map<int, vector<pair<int, FeatureObservation>>> &featureFrame)
-{
-    FrontendQuality frontendQuality;
-    frontendQuality.total_points = static_cast<int>(featureFrame.size());
-    frontendQuality.tracked_after_lk = frontendQuality.total_points;
-    frontendQuality.tracked_after_ransac = frontendQuality.total_points;
-    latest_frontend_quality_ = frontendQuality;
     mBuf.lock();
-    featureBuf.push(FeatureMeasurement(t, featureFrame, frontendQuality));
+    featureBuf.push(make_pair(t, featureFrame));
     mBuf.unlock();
 
     if(!MULTIPLE_THREAD)
@@ -471,15 +612,15 @@ void Estimator::processMeasurements()
     while (1)
     {
         //printf("process measurments\n");
-        FeatureMeasurement feature;
+        pair<double, map<int, vector<pair<int, Eigen::Matrix<double, 7, 1> > > > > feature;
         vector<pair<double, Eigen::Vector3d>> accVector, gyrVector;
         if(!featureBuf.empty())
         {
             feature = featureBuf.front();
-            curTime = feature.t + td;
+            curTime = feature.first + td;
             while(1)
             {
-                if ((!USE_IMU  || IMUAvailable(feature.t + td)))
+                if ((!USE_IMU  || IMUAvailable(feature.first + td)))
                     break;
                 else
                 {
@@ -505,12 +646,7 @@ void Estimator::processMeasurements()
                 {
                     double dt;
                     if(i == 0)
-                    {
-                        if (prevTime < 0.0 || !std::isfinite(prevTime))
-                            dt = 0.0;
-                        else
-                            dt = accVector[i].first - prevTime;
-                    }
+                        dt = accVector[i].first - prevTime;
                     else if (i == accVector.size() - 1)
                         dt = curTime - accVector[i - 1].first;
                     else
@@ -519,14 +655,14 @@ void Estimator::processMeasurements()
                 }
             }
             mProcess.lock();
-            processImage(feature.features, feature.t, feature.quality);
+            processImage(feature.second, feature.first);
             prevTime = curTime;
 
             printStatistics(*this, 0);
 
             std_msgs::Header header;
             header.frame_id = "world";
-            header.stamp = ros::Time(feature.t);
+            header.stamp = ros::Time(feature.first);
 
             pubOdometry(*this, header);
             pubKeyPoses(*this, header);
@@ -585,14 +721,6 @@ void Estimator::processIMU(double t, double dt, const Vector3d &linear_accelerat
         gyr_0 = angular_velocity;
     }
 
-    if (!std::isfinite(dt) || dt <= 0.0 || dt > 0.05)
-    {
-        ROS_WARN_THROTTLE(1.0, "skip abnormal IMU dt: %.6f at t=%.6f", dt, t);
-        acc_0 = linear_acceleration;
-        gyr_0 = angular_velocity;
-        return;
-    }
-
     if (!pre_integrations[frame_count])
     {
         pre_integrations[frame_count] = new IntegrationBase{acc_0, gyr_0, Bas[frame_count], Bgs[frame_count]};
@@ -620,17 +748,10 @@ void Estimator::processIMU(double t, double dt, const Vector3d &linear_accelerat
     gyr_0 = angular_velocity; 
 }
 
-void Estimator::processImage(const map<int, vector<pair<int, FeatureObservation>>> &image,
-                             const double header,
-                             const FrontendQuality &frontend_quality)
+void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, const double header)
 {
     ROS_DEBUG("new image coming ------------------------------------------");
     ROS_DEBUG("Adding feature points %lu", image.size());
-    latest_frontend_quality_ = frontend_quality;
-    const bool skip_visual_frame = shouldSkipVisualFrame(image, frontend_quality);
-    if (skip_visual_frame)
-        ROS_DEBUG("visual frame kept with soft weights despite degraded frontend: %lu points", image.size());
-
     if (f_manager.addFeatureCheckParallax(frame_count, image, td))
     {
         marginalization_flag = MARGIN_OLD;
@@ -641,7 +762,6 @@ void Estimator::processImage(const map<int, vector<pair<int, FeatureObservation>
         marginalization_flag = MARGIN_SECOND_NEW;
         //printf("non-keyframe\n");
     }
-    updateVisualHealth(image, frontend_quality, header);
 
     ROS_DEBUG("%s", marginalization_flag ? "Non-keyframe" : "Keyframe");
     ROS_DEBUG("Solving %d", frame_count);
@@ -689,9 +809,6 @@ void Estimator::processImage(const map<int, vector<pair<int, FeatureObservation>
                     optimization();
                     updateLatestStates();
                     solver_flag = NON_LINEAR;
-                    nonlinear_start_time_ = header;
-                    nonlinear_frame_count_ = 0;
-                    bias_failure_count_ = 0;
                     slideWindow();
                     ROS_INFO("Initialization finish!");
                 }
@@ -715,37 +832,14 @@ void Estimator::processImage(const map<int, vector<pair<int, FeatureObservation>
                     frame_it->second.T = Ps[i];
                     i++;
                 }
-                if (!isStereoInitializationReady(header))
-                {
-                    ++stereo_init_ready_reject_count_;
-                    ROS_WARN("VINS stereo init ready gate slide retry %d at %.3f",
-                             stereo_init_ready_reject_count_, header);
-                    slideInitializationCandidate(header);
-                    return;
-                }
-                if (!solveGyroscopeBias(all_image_frame, Bgs))
-                {
-                    resetInitializationCandidate(header);
-                    return;
-                }
+                solveGyroscopeBias(all_image_frame, Bgs);
                 for (int i = 0; i <= WINDOW_SIZE; i++)
                 {
-                    if (pre_integrations[i] != nullptr)
-                        pre_integrations[i]->repropagate(Vector3d::Zero(), Bgs[i]);
+                    pre_integrations[i]->repropagate(Vector3d::Zero(), Bgs[i]);
                 }
                 optimization();
                 updateLatestStates();
-                logStereoInitializationQuality(header);
-                if (!isStereoInitializationSane(header))
-                {
-                    resetInitializationCandidate(header);
-                    return;
-                }
                 solver_flag = NON_LINEAR;
-                nonlinear_start_time_ = header;
-                nonlinear_frame_count_ = 0;
-                bias_failure_count_ = 0;
-                stereo_init_ready_reject_count_ = 0;
                 slideWindow();
                 ROS_INFO("Initialization finish!");
             }
@@ -763,9 +857,6 @@ void Estimator::processImage(const map<int, vector<pair<int, FeatureObservation>
                 optimization();
                 updateLatestStates();
                 solver_flag = NON_LINEAR;
-                nonlinear_start_time_ = header;
-                nonlinear_frame_count_ = 0;
-                bias_failure_count_ = 0;
                 slideWindow();
                 ROS_INFO("Initialization finish!");
             }
@@ -790,25 +881,14 @@ void Estimator::processImage(const map<int, vector<pair<int, FeatureObservation>
             f_manager.initFramePoseByPnP(frame_count, Ps, Rs, tic, ric);
         f_manager.triangulate(frame_count, Ps, Rs, tic, ric);
         optimization();
-        latest_estimator_latency_ms_ = std::max(0.0, (ros::Time::now().toSec() - header) * 1000.0);
         set<int> removeIndex;
-        if (!isBlind())
-        {
-            outliersRejection(removeIndex);
-            f_manager.removeOutlier(removeIndex);
-        }
+        outliersRejection(removeIndex);
+        f_manager.removeOutlier(removeIndex);
         if (! MULTIPLE_THREAD)
         {
-            std::lock_guard<std::mutex> lock(mTracker);
             featureTracker.removeOutliers(removeIndex);
             predictPtsInNextFrame();
         }
-        else
-        {
-            std::lock_guard<std::mutex> lock(mTracker);
-            predictPtsInNextFrame();
-        }
-        ++nonlinear_frame_count_;
             
         ROS_DEBUG("solver costs: %fms", t_solve.toc());
 
@@ -833,474 +913,8 @@ void Estimator::processImage(const map<int, vector<pair<int, FeatureObservation>
         last_P = Ps[WINDOW_SIZE];
         last_R0 = Rs[0];
         last_P0 = Ps[0];
-        last_state_valid_ = true;
         updateLatestStates();
     }  
-}
-
-void Estimator::logStereoInitializationGateStats(double header, const char *tag) const
-{
-    int stereo_obs = 0;
-    int long_tracks = 0;
-    int valid_depth = 0;
-    for (const auto &it_per_id : f_manager.feature)
-    {
-        bool has_stereo = false;
-        for (const auto &it_per_frame : it_per_id.feature_per_frame)
-        {
-            if (it_per_frame.is_stereo)
-            {
-                has_stereo = true;
-                stereo_obs++;
-            }
-        }
-        if (has_stereo && static_cast<int>(it_per_id.feature_per_frame.size()) >= 4)
-            long_tracks++;
-        if (it_per_id.estimated_depth > 0.0 && it_per_id.estimated_depth < 20.0)
-            valid_depth++;
-    }
-
-    int low_dynamic_frames = 0;
-    double max_gyr = 0.0;
-    double max_acc_dev = 0.0;
-    double sum_gyr2 = 0.0;
-    int gyr_count = 0;
-    Vector3d acc_mean = Vector3d::Zero();
-    int acc_count = 0;
-    for (int i = 0; i <= frame_count; i++)
-    {
-        if (isLowDynamic(i))
-            low_dynamic_frames++;
-
-        for (size_t k = 0; k < angular_velocity_buf[i].size(); k++)
-        {
-            max_gyr = std::max(max_gyr, angular_velocity_buf[i][k].norm());
-            sum_gyr2 += angular_velocity_buf[i][k].squaredNorm();
-            gyr_count++;
-        }
-        for (size_t k = 0; k < linear_acceleration_buf[i].size(); k++)
-        {
-            max_acc_dev = std::max(max_acc_dev, fabs(linear_acceleration_buf[i][k].norm() - G.norm()));
-            acc_mean += linear_acceleration_buf[i][k];
-            acc_count++;
-        }
-    }
-    if (acc_count > 0)
-        acc_mean /= static_cast<double>(acc_count);
-
-    double acc_excitation2 = 0.0;
-    for (int i = 0; i <= frame_count; i++)
-    {
-        for (size_t k = 0; k < linear_acceleration_buf[i].size(); k++)
-            acc_excitation2 += (linear_acceleration_buf[i][k] - acc_mean).squaredNorm();
-    }
-    const double acc_excitation_rms = acc_count > 0 ? std::sqrt(acc_excitation2 / static_cast<double>(acc_count)) : 0.0;
-    const double gyr_rms = gyr_count > 0 ? std::sqrt(sum_gyr2 / static_cast<double>(gyr_count)) : 0.0;
-    double preint_motion = 0.0;
-    double preint_motion_sum = 0.0;
-    for (int i = 1; i <= frame_count; i++)
-    {
-        if (pre_integrations[i] == nullptr)
-            continue;
-        const double alpha_norm = pre_integrations[i]->delta_p.norm();
-        preint_motion = std::max(preint_motion, alpha_norm);
-        preint_motion_sum += alpha_norm;
-    }
-
-    const int motion_frames = frame_count + 1 - low_dynamic_frames;
-    const double low_dynamic_ratio = (frame_count + 1) > 0 ?
-        static_cast<double>(low_dynamic_frames) / static_cast<double>(frame_count + 1) : 1.0;
-    const double long_track_ratio = f_manager.last_track_num > 0 ?
-        static_cast<double>(f_manager.long_track_num) / static_cast<double>(f_manager.last_track_num) : 0.0;
-
-    ROS_WARN("VINS stereo init gate stats %s at %.3f: motion_frames=%d tracks=%d long=%d stereo_obs=%d valid_depth=%d par=%.2f lowdyn=%d/%d lowdyn_ratio=%.2f long_ratio=%.2f max_gyr=%.2f gyr_rms=%.3f max_acc_dev=%.2f acc_exc_rms=%.3f preint_max=%.5f preint_sum=%.5f",
-             tag, header, motion_frames, f_manager.last_track_num, f_manager.long_track_num,
-             stereo_obs, valid_depth, f_manager.last_average_parallax,
-             low_dynamic_frames, frame_count + 1, low_dynamic_ratio, long_track_ratio,
-             max_gyr, gyr_rms, max_acc_dev, acc_excitation_rms,
-             preint_motion, preint_motion_sum);
-}
-
-bool Estimator::isStereoInitializationReady(double header) const
-{
-    int stereo_obs = 0;
-    int long_tracks = 0;
-    int valid_depth = 0;
-    for (const auto &it_per_id : f_manager.feature)
-    {
-        bool has_stereo = false;
-        for (const auto &it_per_frame : it_per_id.feature_per_frame)
-        {
-            if (it_per_frame.is_stereo)
-            {
-                has_stereo = true;
-                stereo_obs++;
-            }
-        }
-        if (has_stereo && static_cast<int>(it_per_id.feature_per_frame.size()) >= 4)
-            long_tracks++;
-        if (it_per_id.estimated_depth > 0.0 && it_per_id.estimated_depth < 20.0)
-            valid_depth++;
-    }
-
-    int low_dynamic_frames = 0;
-    double max_gyr = 0.0;
-    double max_acc_dev = 0.0;
-    double sum_gyr2 = 0.0;
-    int gyr_count = 0;
-    Vector3d acc_mean = Vector3d::Zero();
-    int acc_count = 0;
-    for (int i = 0; i <= frame_count; i++)
-    {
-        if (isLowDynamic(i))
-            low_dynamic_frames++;
-
-        for (size_t k = 0; k < angular_velocity_buf[i].size(); k++)
-        {
-            max_gyr = std::max(max_gyr, angular_velocity_buf[i][k].norm());
-            sum_gyr2 += angular_velocity_buf[i][k].squaredNorm();
-            gyr_count++;
-        }
-        for (size_t k = 0; k < linear_acceleration_buf[i].size(); k++)
-        {
-            max_acc_dev = std::max(max_acc_dev, fabs(linear_acceleration_buf[i][k].norm() - G.norm()));
-            acc_mean += linear_acceleration_buf[i][k];
-            acc_count++;
-        }
-    }
-    if (acc_count > 0)
-        acc_mean /= static_cast<double>(acc_count);
-
-    double acc_excitation2 = 0.0;
-    for (int i = 0; i <= frame_count; i++)
-    {
-        for (size_t k = 0; k < linear_acceleration_buf[i].size(); k++)
-            acc_excitation2 += (linear_acceleration_buf[i][k] - acc_mean).squaredNorm();
-    }
-    const double acc_excitation_rms = acc_count > 0 ? std::sqrt(acc_excitation2 / static_cast<double>(acc_count)) : 0.0;
-    const double gyr_rms = gyr_count > 0 ? std::sqrt(sum_gyr2 / static_cast<double>(gyr_count)) : 0.0;
-    double preint_motion = 0.0;
-    double preint_motion_sum = 0.0;
-    for (int i = 1; i <= frame_count; i++)
-    {
-        if (pre_integrations[i] == nullptr)
-            continue;
-        const double alpha_norm = pre_integrations[i]->delta_p.norm();
-        preint_motion = std::max(preint_motion, alpha_norm);
-        preint_motion_sum += alpha_norm;
-    }
-
-    const int motion_frames = frame_count + 1 - low_dynamic_frames;
-    const double low_dynamic_ratio = (frame_count + 1) > 0 ?
-        static_cast<double>(low_dynamic_frames) / static_cast<double>(frame_count + 1) : 1.0;
-    const double long_track_ratio = f_manager.last_track_num > 0 ?
-        static_cast<double>(f_manager.long_track_num) / static_cast<double>(f_manager.last_track_num) : 0.0;
-    const bool not_enough_motion = motion_frames < 3;
-    const bool low_parallax = f_manager.last_average_parallax < 1.0;
-    // Use sustained IMU energy as the primary "violent motion" signal. A
-    // single gyro/acceleration peak during UAV takeoff should not veto an
-    // otherwise well-constrained initialization window.
-    const bool violent_gyr_rms = gyr_rms > 0.45;
-    const bool violent_gyr_spike = max_gyr > 1.8;
-    const bool violent_acc_sustained = max_acc_dev > 6.0 && acc_excitation_rms > 2.0;
-    const bool violent_preint = preint_motion > 0.05;
-    const bool violent_motion =
-        violent_gyr_rms || violent_gyr_spike || violent_acc_sustained || violent_preint;
-    const bool excessive_parallax = f_manager.last_average_parallax > 12.0 && !violent_motion &&
-                                    max_gyr < 0.12 && max_acc_dev < 0.25;
-    const bool front_end_healthy = f_manager.last_track_num >= 80 &&
-                                   f_manager.long_track_num >= 50 &&
-                                   long_tracks >= 50 &&
-                                   stereo_obs >= 80 &&
-                                   valid_depth >= 20;
-    const bool escape_ready = stereo_init_ready_reject_count_ >= 30 && front_end_healthy &&
-                              !not_enough_motion && !low_parallax && !excessive_parallax &&
-                              !violent_motion;
-    const bool low_acc_excitation = acc_excitation_rms < 0.12 && !escape_ready;
-    const bool enough_tracks = escape_ready ||
-                               (f_manager.last_track_num >= 100 &&
-                                f_manager.long_track_num >= 80 &&
-                                long_tracks >= 80);
-    const bool enough_stereo = stereo_obs >= 80 && valid_depth >= 20;
-
-    if (not_enough_motion || low_parallax || excessive_parallax ||
-        violent_motion || low_acc_excitation || !enough_tracks || !enough_stereo)
-    {
-        ROS_WARN("VINS stereo init gate reject at %.3f: motion_frames=%d low_parallax=%d excessive_parallax=%d violent=%d violent_gyr_rms=%d violent_gyr_spike=%d violent_acc=%d violent_preint=%d low_acc_exc=%d escape=%d retry=%d tracks=%d long=%d stereo_obs=%d valid_depth=%d par=%.2f lowdyn=%d/%d lowdyn_ratio=%.2f long_ratio=%.2f max_gyr=%.2f gyr_rms=%.3f max_acc_dev=%.2f acc_exc_rms=%.3f preint_max=%.5f preint_sum=%.5f",
-                 header, motion_frames, low_parallax, excessive_parallax, violent_motion,
-                 violent_gyr_rms, violent_gyr_spike, violent_acc_sustained, violent_preint,
-                 low_acc_excitation, escape_ready, stereo_init_ready_reject_count_,
-                 f_manager.last_track_num, f_manager.long_track_num,
-                 stereo_obs, valid_depth, f_manager.last_average_parallax,
-                 low_dynamic_frames, frame_count + 1, low_dynamic_ratio, long_track_ratio,
-                 max_gyr, gyr_rms, max_acc_dev, acc_excitation_rms,
-                 preint_motion, preint_motion_sum);
-        return false;
-    }
-
-    ROS_WARN("VINS stereo init gate accept at %.3f: motion_frames=%d escape=%d retry=%d tracks=%d long=%d stereo_obs=%d valid_depth=%d par=%.2f lowdyn=%d/%d lowdyn_ratio=%.2f long_ratio=%.2f max_gyr=%.2f gyr_rms=%.3f max_acc_dev=%.2f acc_exc_rms=%.3f preint_max=%.5f preint_sum=%.5f",
-             header, motion_frames, escape_ready, stereo_init_ready_reject_count_,
-             f_manager.last_track_num, f_manager.long_track_num,
-             stereo_obs, valid_depth, f_manager.last_average_parallax,
-             low_dynamic_frames, frame_count + 1, low_dynamic_ratio, long_track_ratio,
-             max_gyr, gyr_rms, max_acc_dev, acc_excitation_rms,
-             preint_motion, preint_motion_sum);
-    return true;
-}
-
-bool Estimator::isStereoInitializationSane(double header) const
-{
-    double max_speed = 0.0;
-    double max_step = 0.0;
-    double max_acc_bias = 0.0;
-    double max_gyr_bias = 0.0;
-    for (int i = 0; i <= frame_count; i++)
-    {
-        if (!Ps[i].allFinite() || !Vs[i].allFinite() || !Bas[i].allFinite() ||
-            !Bgs[i].allFinite() || !Rs[i].allFinite())
-        {
-            ROS_WARN("VINS stereo init sanity reject at %.3f: non-finite state at frame %d", header, i);
-            return false;
-        }
-
-        max_speed = std::max(max_speed, Vs[i].norm());
-        max_acc_bias = std::max(max_acc_bias, Bas[i].norm());
-        max_gyr_bias = std::max(max_gyr_bias, Bgs[i].norm());
-        if (i > 0)
-            max_step = std::max(max_step, (Ps[i] - Ps[i - 1]).norm());
-    }
-
-    const double window_motion = (Ps[frame_count] - Ps[0]).norm();
-    if (max_speed > 8.0 || max_step > 2.0 || max_acc_bias > 1.5 || max_gyr_bias > 0.3)
-    {
-        ROS_WARN("VINS stereo init sanity reject at %.3f: max_speed=%.3f max_step=%.3f window_motion=%.3f ba=%.3f bg=%.3f",
-                 header, max_speed, max_step, window_motion, max_acc_bias, max_gyr_bias);
-        return false;
-    }
-
-    ROS_WARN("VINS stereo init sanity accept at %.3f: max_speed=%.3f max_step=%.3f window_motion=%.3f ba=%.3f bg=%.3f",
-             header, max_speed, max_step, window_motion, max_acc_bias, max_gyr_bias);
-    return true;
-}
-
-void Estimator::logStereoInitializationQuality(double header) const
-{
-    std::vector<double> reproj_errors;
-    int valid_landmarks = 0;
-    int visual_obs = 0;
-    int stereo_obs = 0;
-    for (const auto &it_per_id : f_manager.feature)
-    {
-        if (it_per_id.estimated_depth <= 0.0 || it_per_id.estimated_depth > 20.0 ||
-            it_per_id.feature_per_frame.empty())
-            continue;
-
-        valid_landmarks++;
-        const int imu_i = it_per_id.start_frame;
-        if (imu_i < 0 || imu_i > frame_count)
-            continue;
-
-        const Vector3d pts_i = it_per_id.feature_per_frame[0].point;
-        const double depth = it_per_id.estimated_depth;
-        int imu_j = imu_i - 1;
-        for (const auto &it_per_frame : it_per_id.feature_per_frame)
-        {
-            imu_j++;
-            if (imu_j < 0 || imu_j > frame_count)
-                continue;
-
-            if (imu_i != imu_j)
-            {
-                const double err = reprojectionError(Rs[imu_i], Ps[imu_i], ric[0], tic[0],
-                                                     Rs[imu_j], Ps[imu_j], ric[0], tic[0],
-                                                     depth, pts_i, it_per_frame.point);
-                if (std::isfinite(err))
-                {
-                    reproj_errors.push_back(err * FOCAL_LENGTH);
-                    visual_obs++;
-                }
-            }
-
-            if (it_per_frame.is_stereo)
-            {
-                const double err = reprojectionError(Rs[imu_i], Ps[imu_i], ric[0], tic[0],
-                                                     Rs[imu_j], Ps[imu_j], ric[1], tic[1],
-                                                     depth, pts_i, it_per_frame.pointRight);
-                if (std::isfinite(err))
-                {
-                    reproj_errors.push_back(err * FOCAL_LENGTH);
-                    stereo_obs++;
-                }
-            }
-        }
-    }
-
-    std::vector<double> imu_rot_res;
-    std::vector<double> imu_vel_res;
-    std::vector<double> imu_pos_res;
-    for (int i = 0; i < frame_count; i++)
-    {
-        const int j = i + 1;
-        if (pre_integrations[j] == nullptr || pre_integrations[j]->sum_dt <= 0.0)
-            continue;
-
-        const double dt = pre_integrations[j]->sum_dt;
-        const Matrix3d dp_dba = pre_integrations[j]->jacobian.template block<3, 3>(O_P, O_BA);
-        const Matrix3d dp_dbg = pre_integrations[j]->jacobian.template block<3, 3>(O_P, O_BG);
-        const Matrix3d dv_dba = pre_integrations[j]->jacobian.template block<3, 3>(O_V, O_BA);
-        const Matrix3d dv_dbg = pre_integrations[j]->jacobian.template block<3, 3>(O_V, O_BG);
-        const Matrix3d dq_dbg = pre_integrations[j]->jacobian.template block<3, 3>(O_R, O_BG);
-        const Vector3d dba = Bas[i] - pre_integrations[j]->linearized_ba;
-        const Vector3d dbg = Bgs[i] - pre_integrations[j]->linearized_bg;
-
-        const Quaterniond corrected_delta_q =
-            pre_integrations[j]->delta_q * Utility::deltaQ(dq_dbg * dbg);
-        const Vector3d corrected_delta_v =
-            pre_integrations[j]->delta_v + dv_dba * dba + dv_dbg * dbg;
-        const Vector3d corrected_delta_p =
-            pre_integrations[j]->delta_p + dp_dba * dba + dp_dbg * dbg;
-
-        const Quaterniond Qi(Rs[i]);
-        const Quaterniond Qj(Rs[j]);
-        const Vector3d r_theta =
-            2.0 * (corrected_delta_q.inverse() * (Qi.inverse() * Qj)).vec();
-        const Vector3d r_beta =
-            Qi.inverse() * (Vs[j] - Vs[i] - g * dt) - corrected_delta_v;
-        const Vector3d r_alpha =
-            Qi.inverse() * (Ps[j] - Ps[i] - Vs[i] * dt - 0.5 * g * dt * dt) - corrected_delta_p;
-
-        imu_rot_res.push_back(r_theta.norm());
-        imu_vel_res.push_back(r_beta.norm());
-        imu_pos_res.push_back(r_alpha.norm());
-    }
-
-    auto percentile = [](std::vector<double> values, double q) -> double {
-        if (values.empty())
-            return -1.0;
-        std::sort(values.begin(), values.end());
-        const double pos = q * static_cast<double>(values.size() - 1);
-        const size_t lo = static_cast<size_t>(std::floor(pos));
-        const size_t hi = static_cast<size_t>(std::ceil(pos));
-        if (lo == hi)
-            return values[lo];
-        return values[lo] * (static_cast<double>(hi) - pos) +
-               values[hi] * (pos - static_cast<double>(lo));
-    };
-
-    ROS_WARN("VINS stereo init quality at %.3f: reproj_med_px=%.3f reproj_p90_px=%.3f valid_landmarks=%d visual_obs=%d stereo_obs=%d imu_rot_med=%.5f imu_vel_med=%.5f imu_pos_med=%.5f",
-             header,
-             percentile(reproj_errors, 0.5), percentile(reproj_errors, 0.9),
-             valid_landmarks, visual_obs, stereo_obs,
-             percentile(imu_rot_res, 0.5),
-             percentile(imu_vel_res, 0.5),
-             percentile(imu_pos_res, 0.5));
-}
-
-void Estimator::resetInitializationCandidate(double header)
-{
-    const Matrix3d current_R = Rs[frame_count];
-    const Vector3d current_Ba = Bas[frame_count];
-    const Vector3d current_Bg = Bgs[frame_count];
-
-    for (auto &it : all_image_frame)
-    {
-        if (it.second.pre_integration != nullptr)
-        {
-            delete it.second.pre_integration;
-            it.second.pre_integration = nullptr;
-        }
-    }
-    all_image_frame.clear();
-
-    for (int i = 0; i < WINDOW_SIZE + 1; i++)
-    {
-        if (pre_integrations[i] != nullptr)
-            delete pre_integrations[i];
-        pre_integrations[i] = nullptr;
-
-        Headers[i] = 0.0;
-        Ps[i].setZero();
-        Vs[i].setZero();
-        Rs[i] = current_R;
-        Bas[i] = current_Ba;
-        Bgs[i] = current_Bg;
-        dt_buf[i].clear();
-        linear_acceleration_buf[i].clear();
-        angular_velocity_buf[i].clear();
-    }
-
-    if (tmp_pre_integration != nullptr)
-        delete tmp_pre_integration;
-    tmp_pre_integration = new IntegrationBase{acc_0, gyr_0, Bas[0], Bgs[0]};
-
-    frame_count = 0;
-    marginalization_flag = MARGIN_OLD;
-    stereo_init_ready_reject_count_ = 0;
-    initial_timestamp = header;
-    f_manager.clearState();
-
-    ROS_WARN("VINS stereo init candidate reset at %.3f", header);
-}
-
-void Estimator::slideInitializationCandidate(double header)
-{
-    if (frame_count != WINDOW_SIZE)
-    {
-        ROS_WARN("VINS stereo init candidate slide ignored at %.3f: frame_count=%d",
-                 header, frame_count);
-        return;
-    }
-
-    const double t_0 = Headers[0];
-    back_R0 = Rs[0];
-    back_P0 = Ps[0];
-
-    for (int i = 0; i < WINDOW_SIZE; i++)
-    {
-        Headers[i] = Headers[i + 1];
-        Rs[i].swap(Rs[i + 1]);
-        Ps[i].swap(Ps[i + 1]);
-        Vs[i].swap(Vs[i + 1]);
-        Bas[i].swap(Bas[i + 1]);
-        Bgs[i].swap(Bgs[i + 1]);
-        std::swap(pre_integrations[i], pre_integrations[i + 1]);
-        dt_buf[i].swap(dt_buf[i + 1]);
-        linear_acceleration_buf[i].swap(linear_acceleration_buf[i + 1]);
-        angular_velocity_buf[i].swap(angular_velocity_buf[i + 1]);
-    }
-
-    Headers[WINDOW_SIZE] = Headers[WINDOW_SIZE - 1];
-    Ps[WINDOW_SIZE] = Ps[WINDOW_SIZE - 1];
-    Rs[WINDOW_SIZE] = Rs[WINDOW_SIZE - 1];
-    Vs[WINDOW_SIZE] = Vs[WINDOW_SIZE - 1];
-    Bas[WINDOW_SIZE] = Bas[WINDOW_SIZE - 1];
-    Bgs[WINDOW_SIZE] = Bgs[WINDOW_SIZE - 1];
-
-    if (pre_integrations[WINDOW_SIZE] != nullptr)
-        delete pre_integrations[WINDOW_SIZE];
-    pre_integrations[WINDOW_SIZE] =
-        new IntegrationBase{acc_0, gyr_0, Bas[WINDOW_SIZE], Bgs[WINDOW_SIZE]};
-    dt_buf[WINDOW_SIZE].clear();
-    linear_acceleration_buf[WINDOW_SIZE].clear();
-    angular_velocity_buf[WINDOW_SIZE].clear();
-
-    for (auto it = all_image_frame.begin(); it != all_image_frame.end();)
-    {
-        if (it->first > t_0 + 1e-9)
-            break;
-        if (it->second.pre_integration != nullptr)
-        {
-            delete it->second.pre_integration;
-            it->second.pre_integration = nullptr;
-        }
-        it = all_image_frame.erase(it);
-    }
-
-    f_manager.removeBack();
-    marginalization_flag = MARGIN_OLD;
-
-    ROS_WARN("VINS stereo init candidate slide at %.3f: dropped %.3f retry=%d",
-             header, t_0, stereo_init_ready_reject_count_);
 }
 
 bool Estimator::initialStructure()
@@ -1585,7 +1199,7 @@ void Estimator::vector2double()
 
     VectorXd dep = f_manager.getDepthVector();
     for (int i = 0; i < f_manager.getFeatureCount(); i++)
-        para_Feature[i][0] = std::min(std::max(dep(i), kInvDepthMin), kInvDepthMax);
+        para_Feature[i][0] = dep(i);
 
     para_Td[0][0] = td;
 }
@@ -1676,1156 +1290,55 @@ void Estimator::double2vector()
     if(USE_IMU)
         td = para_Td[0][0];
 
-    applyLowFlowStationaryLock();
 }
 
 bool Estimator::failureDetection()
 {
+    return false;
     if (f_manager.last_track_num < 2)
     {
-        ++little_feature_count_;
-        const int grace_frames = std::max(8, FAILURE_GRACE_FRAMES);
-        const double header = Headers[WINDOW_SIZE] > 0.0 ? Headers[WINDOW_SIZE] : latest_time;
-        if (BLIND_ENABLE && USE_IMU && solver_flag == NON_LINEAR && !blind_active)
-        {
-            visual_state = VISUAL_BLIND;
-            pending_state_ = VISUAL_BLIND;
-            pending_count_ = 0;
-            enterBlind(header);
-        }
-        if (little_feature_count_ < grace_frames)
-        {
-            ROS_WARN("VINS little-feature blind grace %d/%d: backend_tracks=%d frontend_pts=%d",
-                     little_feature_count_, grace_frames, f_manager.last_track_num,
-                     latest_frontend_quality_.total_points);
-            return false;
-        }
-        ROS_INFO(" little feature %d for %d frames", f_manager.last_track_num, little_feature_count_);
-        return true;
+        ROS_INFO(" little feature %d", f_manager.last_track_num);
+        //return true;
     }
-    little_feature_count_ = 0;
-
-    if (!Ps[WINDOW_SIZE].allFinite() || !Rs[WINDOW_SIZE].allFinite())
+    if (Bas[WINDOW_SIZE].norm() > 2.5)
     {
-        ROS_WARN("non-finite pose state");
+        ROS_INFO(" big IMU acc bias estimation %f", Bas[WINDOW_SIZE].norm());
         return true;
     }
-    if (USE_IMU && (!Vs[WINDOW_SIZE].allFinite() ||
-                    !Bas[WINDOW_SIZE].allFinite() ||
-                    !Bgs[WINDOW_SIZE].allFinite()))
+    if (Bgs[WINDOW_SIZE].norm() > 1.0)
     {
-        ROS_WARN("non-finite speed/bias state");
+        ROS_INFO(" big IMU gyr bias estimation %f", Bgs[WINDOW_SIZE].norm());
         return true;
     }
-
-    const double acc_bias_max = std::max(0.1, BLIND_BIAS_ACC_MAX);
-    const double gyr_bias_max = std::max(0.01, BLIND_BIAS_GYR_MAX);
-    const double immediate_frame_jump =
-        last_state_valid_ ? (Ps[WINDOW_SIZE] - last_P).norm() : 0.0;
-    if (last_state_valid_ && immediate_frame_jump > FAILURE_POSE_JUMP_HARD)
+    /*
+    if (tic(0) > 1)
     {
-        ROS_WARN("VINS failure: hard pose jump %.2fm (instant)", immediate_frame_jump);
+        ROS_INFO(" big extri param estimation %d", tic(0) > 1);
         return true;
     }
-    const bool bias_bad = USE_IMU &&
-                          (Bas[WINDOW_SIZE].norm() > acc_bias_max ||
-                           Bgs[WINDOW_SIZE].norm() > gyr_bias_max);
-    if (bias_bad)
-    {
-        ++bias_failure_count_;
-
-        const double now = Headers[WINDOW_SIZE] > 0.0 ? Headers[WINDOW_SIZE] : latest_time;
-        const double nonlinear_age =
-            (nonlinear_start_time_ > 0.0 && now > nonlinear_start_time_) ?
-            (now - nonlinear_start_time_) : 0.0;
-        const bool startup_grace =
-            nonlinear_frame_count_ < 45 || nonlinear_age < 4.0;
-        const bool bias_grace =
-            startup_grace || bias_failure_count_ < std::max(3, FAILURE_GRACE_FRAMES);
-
-        if (bias_grace)
-        {
-            bool clamped = false;
-            for (int i = 0; i <= frame_count; i++)
-            {
-                const double ba_norm = Bas[i].norm();
-                if (ba_norm > acc_bias_max)
-                {
-                    Bas[i] *= acc_bias_max / ba_norm;
-                    clamped = true;
-                }
-                const double bg_norm = Bgs[i].norm();
-                if (bg_norm > gyr_bias_max)
-                {
-                    Bgs[i] *= gyr_bias_max / bg_norm;
-                    clamped = true;
-                }
-
-                para_SpeedBias[i][3] = Bas[i].x();
-                para_SpeedBias[i][4] = Bas[i].y();
-                para_SpeedBias[i][5] = Bas[i].z();
-                para_SpeedBias[i][6] = Bgs[i].x();
-                para_SpeedBias[i][7] = Bgs[i].y();
-                para_SpeedBias[i][8] = Bgs[i].z();
-            }
-            if (clamped)
-            {
-                for (int i = 0; i <= frame_count; i++)
-                {
-                    if (pre_integrations[i] != nullptr)
-                        pre_integrations[i]->repropagate(Bas[i], Bgs[i]);
-                }
-                if (tmp_pre_integration != nullptr)
-                    tmp_pre_integration->repropagate(Bas[frame_count], Bgs[frame_count]);
-            }
-            ROS_WARN("VINS bias transient clamped %d/%d: Ba=%.3f Bg=%.3f age=%.2fs frames=%d",
-                     bias_failure_count_, std::max(3, FAILURE_GRACE_FRAMES),
-                     Bas[WINDOW_SIZE].norm(), Bgs[WINDOW_SIZE].norm(),
-                     nonlinear_age, nonlinear_frame_count_);
-            return false;
-        }
-
-        if (Bas[WINDOW_SIZE].norm() > acc_bias_max)
-            ROS_INFO(" big IMU acc bias estimation %f", Bas[WINDOW_SIZE].norm());
-        if (Bgs[WINDOW_SIZE].norm() > gyr_bias_max)
-            ROS_INFO(" big IMU gyr bias estimation %f", Bgs[WINDOW_SIZE].norm());
-        return true;
-    }
-    bias_failure_count_ = 0;
-
-    if (!last_state_valid_)
-        return false;
-
+    */
     Vector3d tmp_P = Ps[WINDOW_SIZE];
-    const double frame_jump = (tmp_P - last_P).norm();
-
-    // Hard, unrecoverable divergence -> kill immediately, no grace.
-    if (frame_jump > FAILURE_POSE_JUMP_HARD)
+    if ((tmp_P - last_P).norm() > 5)
     {
-        ROS_WARN("VINS failure: hard pose jump %.2fm (instant)", frame_jump);
-        return true;
+        //ROS_INFO(" big translation");
+        //return true;
     }
-
+    if (abs(tmp_P.z() - last_P.z()) > 1)
+    {
+        //ROS_INFO(" big z translation");
+        //return true; 
+    }
     Matrix3d tmp_R = Rs[WINDOW_SIZE];
     Matrix3d delta_R = tmp_R.transpose() * last_R;
     Quaterniond delta_Q(delta_R);
-    double delta_angle =
-        acos(std::max(-1.0, std::min(1.0, delta_Q.w()))) * 2.0 / 3.14 * 180.0;
-
-    const bool visually_untrusted =
-        isBlind() || isVisualDegraded() ||
-        latest_feature_quality_metrics_[3] > 0.50 ||
-        latest_feature_quality_metrics_[2] < 0.05;
-
-    // Soft anomalies: a single high-dynamic transient (e.g. a momentary quality
-    // collapse during fast re-detection) must NOT kill the system. Require the
-    // anomaly to persist for FAILURE_GRACE_FRAMES consecutive frames.
-    const bool soft_anomaly =
-        (USE_IMU && Vs[WINDOW_SIZE].norm() > 6.0) ||
-        (frame_jump > 1.0) ||
-        (visually_untrusted && frame_jump > 0.35) ||
-        (fabs(tmp_P.z() - last_P.z()) > 0.60) ||
-        (delta_angle > 50);
-
-    if (soft_anomaly)
-        ++soft_failure_count_;
-    else
-        soft_failure_count_ = 0;
-
-    if (soft_failure_count_ >= std::max(1, FAILURE_GRACE_FRAMES))
+    double delta_angle;
+    delta_angle = acos(delta_Q.w()) * 2.0 / 3.14 * 180.0;
+    if (delta_angle > 50)
     {
-        ROS_WARN("VINS failure: %d consecutive anomalies, jump %.2fm vel %.2f angle %.1f health=%d new=%.2f hq=%.2f",
-                 soft_failure_count_, frame_jump, Vs[WINDOW_SIZE].norm(), delta_angle,
-                 getHealthCode(), latest_feature_quality_metrics_[3],
-                 latest_feature_quality_metrics_[2]);
-        return true;
+        ROS_INFO(" big delta_angle ");
+        //return true;
     }
-    if (soft_anomaly)
-        ROS_WARN_THROTTLE(0.5, "VINS soft anomaly %d/%d: jump %.2fm health=%d (grace)",
-                          soft_failure_count_, FAILURE_GRACE_FRAMES, frame_jump, getHealthCode());
     return false;
-}
-
-std::vector<char> Estimator::selectGoodFeatures() const
-{
-    std::vector<char> selected;
-    if (!GOOD_FEATURE_ENABLE)
-        return selected;
-
-    int candidate_count = 0;
-    for (const auto &it_per_id : f_manager.feature)
-    {
-        if (!featureReadyForOptimization(it_per_id))
-            continue;
-        candidate_count++;
-    }
-    if (candidate_count <= 0)
-        return selected;
-
-    selected.assign(candidate_count, 0);
-    const int budget = std::min(candidate_count, std::max(1, GOOD_FEATURE_BUDGET));
-
-    struct Candidate
-    {
-        int index;
-        Eigen::Matrix3d info;
-        double score;
-        int track_len;
-        double parallax_px;
-    };
-    std::vector<Candidate> candidates;
-    candidates.reserve(candidate_count);
-
-    int feature_index = -1;
-    for (const auto &it_per_id : f_manager.feature)
-    {
-        if (!featureReadyForOptimization(it_per_id))
-            continue;
-        ++feature_index;
-
-        const auto &anchor = it_per_id.feature_per_frame.front();
-        Eigen::Vector3d b = anchor.point.normalized();
-        if (!b.allFinite() || b.norm() < 1e-6)
-            b = Eigen::Vector3d::UnitZ();
-        const double score = computeFeatureQualityScore(it_per_id);
-        const int track_len = std::max(1, static_cast<int>(it_per_id.feature_per_frame.size()));
-        const double parallax_px = estimateFeatureParallaxPx(it_per_id);
-        const double reproj_px = estimateFeatureReprojectionErrorPx(it_per_id);
-        const double stereo_consistency = estimateStereoDepthConsistency(it_per_id);
-
-        const bool weak_new_track =
-            track_len < std::max(1, GOOD_FEATURE_NEW_MIN_TRACK_LENGTH) &&
-            score < GOOD_FEATURE_NEW_MIN_QUALITY;
-        const bool low_quality = score < GOOD_FEATURE_MIN_QUALITY;
-        const bool low_parallax =
-            track_len >= GOOD_FEATURE_MIN_TRACK_LENGTH &&
-            parallax_px < GOOD_FEATURE_MIN_PARALLAX;
-        const bool bad_reproj =
-            std::isfinite(reproj_px) && reproj_px > GOOD_FEATURE_MAX_REPROJ_ERROR;
-
-        if (weak_new_track || low_quality || low_parallax || bad_reproj)
-            continue;
-
-        // Projection residuals constrain camera translation on the tangent
-        // plane perpendicular to the bearing. Using b*b^T overstates the
-        // forward/radial direction and can drop rare off-axis anchors.
-        const Eigen::Matrix3d tangent_info = Eigen::Matrix3d::Identity() - b * b.transpose();
-        double depth_weight = 1.0;
-        if (std::isfinite(it_per_id.estimated_depth) && it_per_id.estimated_depth > 0.0)
-            depth_weight = std::max(0.25, std::min(2.0, 4.0 / it_per_id.estimated_depth));
-        const double stereo_weight = std::isfinite(stereo_consistency)
-                                         ? std::max(0.70, std::min(1.0, stereo_consistency))
-                                         : 0.95;
-        const double final_score = std::max(GOOD_FEATURE_MIN_SCALE, score) * stereo_weight;
-        const Eigen::Matrix3d info =
-            final_score * depth_weight * depth_weight * tangent_info;
-
-        candidates.push_back(Candidate{feature_index, info, final_score,
-                                        track_len, parallax_px});
-    }
-
-    if (candidates.empty())
-        return selected;
-
-    if (budget >= static_cast<int>(candidates.size()))
-    {
-        for (const auto &candidate : candidates)
-            selected[candidate.index] = 1;
-        return selected;
-    }
-
-    std::sort(candidates.begin(), candidates.end(),
-              [](const Candidate &a, const Candidate &b)
-              {
-                  if (fabs(a.score - b.score) > 1e-6)
-                      return a.score > b.score;
-                  if (a.track_len != b.track_len)
-                      return a.track_len > b.track_len;
-                  return a.parallax_px > b.parallax_px;
-              });
-
-    Eigen::Matrix3d info = 1e-6 * Eigen::Matrix3d::Identity();
-    const int target_budget = std::min(budget, static_cast<int>(candidates.size()));
-    for (int pick = 0; pick < target_budget; pick++)
-    {
-        double best_gain = -1e18;
-        int best_idx = -1;
-        Eigen::Matrix3d best_info = info;
-        for (size_t i = 0; i < candidates.size(); i++)
-        {
-            const Candidate &c = candidates[i];
-            if (selected[c.index])
-                continue;
-            if (c.track_len < GOOD_FEATURE_MIN_TRACK_LENGTH)
-                continue;
-
-            Eigen::Matrix3d trial = info + c.info;
-            const double gain = safeLogDet(trial) - safeLogDet(info);
-            if (gain > best_gain)
-            {
-                best_gain = gain;
-                best_idx = static_cast<int>(i);
-                best_info = trial;
-            }
-        }
-
-        if (best_idx < 0)
-            break;
-
-        selected[candidates[best_idx].index] = 1;
-        info = best_info;
-    }
-
-    return selected;
-}
-
-double Estimator::estimateFeatureParallaxPx(const FeaturePerId &feature) const
-{
-    if (feature.feature_per_frame.size() < 2)
-        return 0.0;
-
-    const Eigen::Vector2d anchor_uv = feature.feature_per_frame.front().point.head<2>();
-    double best = 0.0;
-    for (size_t i = 1; i < feature.feature_per_frame.size(); i++)
-    {
-        const Eigen::Vector2d uv_i = feature.feature_per_frame[i].point.head<2>();
-        best = std::max(best, (uv_i - anchor_uv).norm() * FOCAL_LENGTH);
-    }
-    return best;
-}
-
-double Estimator::estimateFeatureReprojectionErrorPx(const FeaturePerId &feature) const
-{
-    if (!std::isfinite(feature.estimated_depth) || feature.estimated_depth <= 0.0)
-        return std::numeric_limits<double>::infinity();
-
-    int imu_i = feature.start_frame;
-    int imu_j = imu_i - 1;
-    const Vector3d pts_i = feature.feature_per_frame.front().point;
-    const double depth = feature.estimated_depth;
-    double err = 0.0;
-    int err_cnt = 0;
-
-    for (const auto &frame_obs : feature.feature_per_frame)
-    {
-        imu_j++;
-        if (imu_i != imu_j)
-        {
-            const double tmp_error = reprojectionError(Rs[imu_i], Ps[imu_i], ric[0], tic[0],
-                                                       Rs[imu_j], Ps[imu_j], ric[0], tic[0],
-                                                       depth, pts_i, frame_obs.point);
-            if (!std::isfinite(tmp_error))
-                return std::numeric_limits<double>::infinity();
-            err += tmp_error * FOCAL_LENGTH;
-            err_cnt++;
-        }
-
-        if (STEREO && frame_obs.is_stereo)
-        {
-            const double tmp_error = reprojectionError(Rs[imu_i], Ps[imu_i], ric[0], tic[0],
-                                                       Rs[imu_j], Ps[imu_j], ric[1], tic[1],
-                                                       depth, pts_i, frame_obs.pointRight);
-            if (!std::isfinite(tmp_error))
-                return std::numeric_limits<double>::infinity();
-            err += tmp_error * FOCAL_LENGTH;
-            err_cnt++;
-        }
-    }
-
-    if (err_cnt <= 0)
-        return std::numeric_limits<double>::infinity();
-    return err / static_cast<double>(err_cnt);
-}
-
-double Estimator::estimateStereoDepthConsistency(const FeaturePerId &feature) const
-{
-    if (!STEREO || !std::isfinite(feature.estimated_depth) || feature.estimated_depth <= 0.1)
-        return std::numeric_limits<double>::quiet_NaN();
-
-    std::vector<double> rel_errors;
-    int imu_j = feature.start_frame - 1;
-    for (const auto &frame_obs : feature.feature_per_frame)
-    {
-        imu_j++;
-        if (!frame_obs.is_stereo || imu_j < 0 || imu_j > WINDOW_SIZE)
-            continue;
-
-        Eigen::Matrix<double, 3, 4> leftPose;
-        Eigen::Vector3d t0 = Ps[imu_j] + Rs[imu_j] * tic[0];
-        Eigen::Matrix3d R0 = Rs[imu_j] * ric[0];
-        leftPose.leftCols<3>() = R0.transpose();
-        leftPose.rightCols<1>() = -R0.transpose() * t0;
-
-        Eigen::Matrix<double, 3, 4> rightPose;
-        Eigen::Vector3d t1 = Ps[imu_j] + Rs[imu_j] * tic[1];
-        Eigen::Matrix3d R1 = Rs[imu_j] * ric[1];
-        rightPose.leftCols<3>() = R1.transpose();
-        rightPose.rightCols<1>() = -R1.transpose() * t1;
-
-        Eigen::Vector2d point0 = frame_obs.point.head<2>();
-        Eigen::Vector2d point1 = frame_obs.pointRight.head<2>();
-        Eigen::Matrix4d design_matrix = Eigen::Matrix4d::Zero();
-        design_matrix.row(0) = point0[0] * leftPose.row(2) - leftPose.row(0);
-        design_matrix.row(1) = point0[1] * leftPose.row(2) - leftPose.row(1);
-        design_matrix.row(2) = point1[0] * rightPose.row(2) - rightPose.row(0);
-        design_matrix.row(3) = point1[1] * rightPose.row(2) - rightPose.row(1);
-        Eigen::Vector4d triangulated_point =
-            Eigen::JacobiSVD<Eigen::Matrix4d>(design_matrix, Eigen::ComputeFullV).matrixV().rightCols<1>();
-        if (std::fabs(triangulated_point(3)) < 1e-9)
-            continue;
-        Eigen::Vector3d point3d = triangulated_point.head<3>() / triangulated_point(3);
-
-        Eigen::Vector3d localPoint = leftPose.leftCols<3>() * point3d + leftPose.rightCols<1>();
-        const double stereo_depth = localPoint.z();
-        if (!std::isfinite(stereo_depth) || stereo_depth <= 0.1 || stereo_depth > 100.0)
-            continue;
-
-        const double rel =
-            std::fabs(stereo_depth - feature.estimated_depth) /
-            std::max(0.5, std::max(stereo_depth, feature.estimated_depth));
-        if (std::isfinite(rel))
-            rel_errors.push_back(rel);
-    }
-
-    if (rel_errors.empty())
-        return std::numeric_limits<double>::quiet_NaN();
-
-    const double rel_med = safeMedian(rel_errors);
-    return clampUnit(1.0 / (1.0 + 4.0 * rel_med));
-}
-
-double Estimator::computeFeatureQualityScore(const FeaturePerId &feature) const
-{
-    if (feature.feature_per_frame.empty())
-        return 0.0;
-
-    double frontend_quality = 0.0;
-    int quality_cnt = 0;
-    for (const auto &obs : feature.feature_per_frame)
-    {
-        frontend_quality += std::max(0.05, std::min(1.0, obs.quality));
-        quality_cnt++;
-        if (obs.is_stereo)
-        {
-            frontend_quality += std::max(0.05, std::min(1.0, obs.qualityRight));
-            quality_cnt++;
-        }
-    }
-    frontend_quality = quality_cnt > 0 ? frontend_quality / static_cast<double>(quality_cnt) : 0.0;
-
-    const int track_len = std::max(1, static_cast<int>(feature.feature_per_frame.size()));
-    const double len_weight = clampUnit((track_len + 2.0) / 8.0);
-
-    const double parallax_px = estimateFeatureParallaxPx(feature);
-    double parallax_weight = 0.55;
-    if (track_len >= 2)
-        parallax_weight = clampUnit(parallax_px / std::max(1.0, 2.0 * GOOD_FEATURE_MIN_PARALLAX));
-
-    const double reproj_px = estimateFeatureReprojectionErrorPx(feature);
-    double reproj_weight = 0.65;
-    if (std::isfinite(reproj_px))
-    {
-        reproj_weight = 1.0 / (1.0 + reproj_px / std::max(0.5, GOOD_FEATURE_MAX_REPROJ_ERROR));
-    }
-    else if (track_len >= std::max(3, GOOD_FEATURE_MIN_TRACK_LENGTH))
-    {
-        reproj_weight = 0.45;
-    }
-
-    const double score =
-        0.45 * frontend_quality +
-        0.20 * len_weight +
-        0.20 * parallax_weight +
-        0.15 * reproj_weight;
-    return clampUnit(score);
-}
-
-std::array<double, 4> Estimator::computeFeatureQualityMetrics() const
-{
-    std::vector<double> mature_scores;
-    std::vector<double> fallback_scores;
-    int bad_cnt = 0;
-    int long_hq_cnt = 0;
-    int new_cnt = 0;
-    int active_cnt = 0;
-    int mature_cnt = 0;
-
-    const int mature_track_len = std::max(3, GOOD_FEATURE_MIN_TRACK_LENGTH);
-
-    for (const auto &feature : f_manager.feature)
-    {
-        if (feature.endFrame() != frame_count)
-            continue;
-
-        const int track_len = std::max(1, static_cast<int>(feature.feature_per_frame.size()));
-        active_cnt++;
-        if (track_len <= 2)
-            new_cnt++;
-
-        double frontend_quality = 0.0;
-        int quality_cnt = 0;
-        for (const auto &obs : feature.feature_per_frame)
-        {
-            frontend_quality += std::max(0.05, std::min(1.0, obs.quality));
-            quality_cnt++;
-            if (obs.is_stereo)
-            {
-                frontend_quality += std::max(0.05, std::min(1.0, obs.qualityRight));
-                quality_cnt++;
-            }
-        }
-        frontend_quality = quality_cnt > 0 ? frontend_quality / static_cast<double>(quality_cnt) : 0.0;
-
-        const double parallax_px = estimateFeatureParallaxPx(feature);
-        const bool mature_track =
-            track_len >= mature_track_len &&
-            (std::isfinite(feature.estimated_depth) && feature.estimated_depth > 0.0 ||
-             parallax_px >= 0.5 * GOOD_FEATURE_MIN_PARALLAX);
-
-        if (mature_track)
-        {
-            const double score = computeFeatureQualityScore(feature);
-            mature_scores.push_back(score);
-            mature_cnt++;
-
-            if (score < 0.40)
-                bad_cnt++;
-            if (track_len >= 10 && score >= 0.75)
-                long_hq_cnt++;
-        }
-        else if (track_len >= 2)
-        {
-            fallback_scores.push_back(std::max(0.20, frontend_quality));
-        }
-    }
-
-    if (active_cnt <= 0)
-        return {0.0, 1.0, 0.0, 1.0};
-
-    double qmed = 0.0;
-    double bad_ratio = 1.0;
-    double hq_long_ratio = 0.0;
-    if (!mature_scores.empty())
-    {
-        qmed = safeMedian(mature_scores);
-        bad_ratio = static_cast<double>(bad_cnt) / static_cast<double>(mature_cnt);
-        hq_long_ratio = static_cast<double>(long_hq_cnt) / static_cast<double>(mature_cnt);
-    }
-    else if (!fallback_scores.empty())
-    {
-        qmed = safeMedian(fallback_scores);
-        int fallback_bad = 0;
-        for (double score : fallback_scores)
-            fallback_bad += score < 0.35 ? 1 : 0;
-        bad_ratio = static_cast<double>(fallback_bad) / static_cast<double>(fallback_scores.size());
-    }
-    else
-    {
-        qmed = clampUnit(0.5 * latest_frontend_quality_.lk_keep_ratio +
-                         0.5 * latest_frontend_quality_.coverage_ratio);
-        bad_ratio = qmed < 0.35 ? 1.0 : 0.0;
-    }
-
-    return {
-        qmed,
-        bad_ratio,
-        hq_long_ratio,
-        static_cast<double>(new_cnt) / static_cast<double>(active_cnt)};
-}
-
-bool Estimator::isBlind() const
-{
-    return BLIND_ENABLE && visual_state == VISUAL_BLIND && blind_active;
-}
-
-bool Estimator::isVisualDegraded() const
-{
-    return BLIND_ENABLE && visual_state == VISUAL_DEGRADED;
-}
-
-bool Estimator::isLowFlowStationary() const
-{
-    return LOW_FLOW_ZUPT_ENABLE && solver_flag == NON_LINEAR &&
-           latest_frontend_quality_.tracked_after_lk >= LOW_FLOW_ZUPT_MIN_TRACKS &&
-           latest_frontend_quality_.lk_keep_ratio > 0.80 &&
-           latest_frontend_quality_.mean_pixel_flow >= 0.0 &&
-           latest_frontend_quality_.mean_pixel_flow < LOW_FLOW_ZUPT_FLOW;
-}
-
-void Estimator::applyLowFlowStationaryLock()
-{
-    if (!USE_IMU)
-        return;
-
-    if (solver_flag == NON_LINEAR && !home_loop_origin_valid_ && Ps[frame_count].allFinite())
-    {
-        home_loop_origin_ = Ps[frame_count];
-        home_loop_origin_valid_ = true;
-        home_loop_max_radius_ = 0.0;
-        ROS_WARN("VINS home-loop origin set: P=(%.3f %.3f %.3f)",
-                 home_loop_origin_.x(), home_loop_origin_.y(), home_loop_origin_.z());
-    }
-
-    if (home_loop_origin_valid_ && Ps[frame_count].allFinite())
-        home_loop_max_radius_ = std::max(home_loop_max_radius_,
-                                         (Ps[frame_count] - home_loop_origin_).norm());
-
-    if (!isLowFlowStationary())
-    {
-        if (low_flow_lock_active_)
-            ROS_WARN_THROTTLE(1.0, "VINS low-flow stationary lock released: flow=%.3f tracks=%d",
-                              latest_frontend_quality_.mean_pixel_flow,
-                              latest_frontend_quality_.tracked_after_lk);
-        low_flow_lock_active_ = false;
-        home_loop_active_ = false;
-        home_loop_static_count_ = 0;
-        return;
-    }
-
-    if (!low_flow_lock_active_)
-    {
-        low_flow_lock_P_ = Ps[frame_count].allFinite() ? Ps[frame_count] : latest_P;
-        low_flow_lock_active_ = low_flow_lock_P_.allFinite();
-        ROS_WARN_THROTTLE(1.0, "VINS low-flow stationary lock anchor: flow=%.3f tracks=%d P=(%.3f %.3f %.3f)",
-                          latest_frontend_quality_.mean_pixel_flow,
-                          latest_frontend_quality_.tracked_after_lk,
-                          low_flow_lock_P_.x(), low_flow_lock_P_.y(), low_flow_lock_P_.z());
-    }
-    if (!low_flow_lock_active_)
-        return;
-
-    home_loop_static_count_++;
-    if (HOME_LOOP_ENABLE && home_loop_origin_valid_ &&
-        home_loop_static_count_ >= std::max(1, HOME_LOOP_MIN_STATIC_FRAMES) &&
-        home_loop_max_radius_ >= std::max(0.0, HOME_LOOP_MIN_TRAVEL))
-    {
-        const Eigen::Vector3d drift = low_flow_lock_P_ - home_loop_origin_;
-        const double drift_norm = drift.norm();
-        const double capture_radius = std::max(0.01, HOME_LOOP_CAPTURE_RADIUS);
-        if (std::isfinite(drift_norm) && drift_norm < capture_radius)
-        {
-            const double gain = clampUnit(HOME_LOOP_GAIN);
-            if (gain > 0.0 && drift_norm > 1e-4)
-            {
-                low_flow_lock_P_ -= gain * drift;
-                home_loop_active_ = true;
-                ROS_WARN_THROTTLE(1.0,
-                                  "VINS home-loop closure: drift %.3f -> %.3f, max_radius=%.3f, gain=%.2f",
-                                  drift_norm,
-                                  (low_flow_lock_P_ - home_loop_origin_).norm(),
-                                  home_loop_max_radius_,
-                                  gain);
-            }
-        }
-        else if (std::isfinite(drift_norm))
-        {
-            ROS_WARN_THROTTLE(2.0,
-                              "VINS home-loop not applied: drift %.3f exceeds capture radius %.3f",
-                              drift_norm,
-                              capture_radius);
-        }
-    }
-
-    const int window = std::max(1, LOW_FLOW_ZUPT_WINDOW);
-    const int start = std::max(0, frame_count - window + 1);
-    const double speed_before = Vs[frame_count].norm();
-    for (int i = start; i <= frame_count; ++i)
-    {
-        Ps[i] = low_flow_lock_P_;
-        para_Pose[i][0] = low_flow_lock_P_.x();
-        para_Pose[i][1] = low_flow_lock_P_.y();
-        para_Pose[i][2] = low_flow_lock_P_.z();
-        Vs[i].setZero();
-        para_SpeedBias[i][0] = 0.0;
-        para_SpeedBias[i][1] = 0.0;
-        para_SpeedBias[i][2] = 0.0;
-    }
-    latest_P = low_flow_lock_P_;
-    latest_V.setZero();
-
-    ROS_WARN_THROTTLE(1.0, "VINS low-flow stationary lock: flow=%.3f tracks=%d keep=%.2f vel %.2f -> 0.00 P=(%.3f %.3f %.3f)",
-                      latest_frontend_quality_.mean_pixel_flow,
-                      latest_frontend_quality_.tracked_after_lk,
-                      latest_frontend_quality_.lk_keep_ratio,
-                      speed_before,
-                      low_flow_lock_P_.x(), low_flow_lock_P_.y(), low_flow_lock_P_.z());
-}
-
-bool Estimator::allowImuPropagateOutput() const
-{
-    if (solver_flag != NON_LINEAR)
-        return false;
-    if (isLowFlowStationary())
-        return true;
-    return !isBlind() && !isVisualDegraded();
-}
-
-int Estimator::getFrontendPointCount() const
-{
-    return latest_frontend_quality_.total_points;
-}
-
-double Estimator::getFrontendCoverageRatio() const
-{
-    return latest_frontend_quality_.coverage_ratio;
-}
-
-double Estimator::getFrontendKeepRatio() const
-{
-    return latest_frontend_quality_.lk_keep_ratio;
-}
-
-double Estimator::getLatestEstimatorLatency() const
-{
-    return latest_estimator_latency_ms_;
-}
-
-double Estimator::getFeatureQualityMedian() const
-{
-    return latest_feature_quality_metrics_[0];
-}
-
-double Estimator::getFeatureQualityBadRatio() const
-{
-    return latest_feature_quality_metrics_[1];
-}
-
-double Estimator::getFeatureHighQualityLongRatio() const
-{
-    return latest_feature_quality_metrics_[2];
-}
-
-double Estimator::getFeatureNewRatio() const
-{
-    return latest_feature_quality_metrics_[3];
-}
-
-int Estimator::getHealthCode() const
-{
-    if (solver_flag != NON_LINEAR)
-        return 3;
-    if (isBlind())
-        return 2;
-    if (isVisualDegraded())
-        return 1;
-    return 0;
-}
-
-double Estimator::blindDuration(double header) const
-{
-    if (blind_start_time < 0.0)
-        return 0.0;
-    return std::max(0.0, header - blind_start_time);
-}
-
-void Estimator::enterBlind(double header)
-{
-    if (blind_active)
-        return;
-
-    blind_active = true;
-    blind_anchor_valid = USE_IMU && solver_flag == NON_LINEAR;
-    blind_start_time = header;
-    blind_ba0 = Bas[frame_count];
-    blind_bg0 = Bgs[frame_count];
-    blind_acc_body0 = acc_0;
-    blind_v0 = Vs[frame_count];
-    if (blind_acc_body0.norm() > 1e-3)
-        blind_acc_body0.normalize();
-    ROS_WARN("VINS visual BLIND enter: tracks=%d parallax=%.2f", visual_track_num, visual_parallax);
-}
-
-void Estimator::exitBlind(double header)
-{
-    if (!blind_active)
-        return;
-
-    ROS_WARN("VINS visual BLIND exit after %.2fs: tracks=%d parallax=%.2f",
-             blindDuration(header), visual_track_num, visual_parallax);
-    blind_active = false;
-}
-
-bool Estimator::shouldSkipVisualFrame(const map<int, vector<pair<int, FeatureObservation>>> &image,
-                                      const FrontendQuality &frontend_quality) const
-{
-    const VisualHealthSnapshot snapshot =
-        makeVisualHealthSnapshot(image, frontend_quality, visual_track_num, visual_parallax);
-    const VisualHealthMonitor monitor;
-    return monitor.shouldSkipVisualFrame(snapshot,
-                                         BLIND_ENABLE,
-                                         USE_IMU,
-                                         solver_flag == NON_LINEAR,
-                                         visual_state,
-                                         blind_active);
-}
-
-void Estimator::updateVisualHealth(const map<int, vector<pair<int, FeatureObservation>>> &image,
-                                   const FrontendQuality &frontend_quality,
-                                   double header)
-{
-    if (!BLIND_ENABLE || solver_flag != NON_LINEAR)
-        return;
-
-    visual_track_num = f_manager.last_track_num;
-    visual_parallax = f_manager.last_average_parallax;
-    latest_feature_quality_metrics_ = computeFeatureQualityMetrics();
-    VisualHealthSnapshot snapshot =
-        makeVisualHealthSnapshot(image, frontend_quality, visual_track_num, visual_parallax);
-    snapshot.quality_median = latest_feature_quality_metrics_[0];
-    snapshot.quality_bad_ratio = latest_feature_quality_metrics_[1];
-    snapshot.high_quality_long_ratio = latest_feature_quality_metrics_[2];
-    snapshot.new_feature_ratio = latest_feature_quality_metrics_[3];
-    ROS_INFO_THROTTLE(1.0,
-                      "VINS photometric health: photo=%.2f mean=%.1f dark=%.3f sat=%.3f contrast=%.1f blur=%.1f",
-                      snapshot.photometric_health,
-                      snapshot.brightness_mean,
-                      snapshot.dark_ratio,
-                      snapshot.saturated_ratio,
-                      snapshot.contrast_std,
-                      snapshot.blur_score);
-    const VisualHealthMonitor monitor;
-    VisualState target = monitor.classify(snapshot,
-                                          BLIND_ENABLE,
-                                          solver_flag == NON_LINEAR,
-                                          visual_state,
-                                          blind_active);
-    // A frame is "blind" only when visual INFORMATION is genuinely missing.
-    // qmed/bad/hq/new all measure TRACK AGE, not visual viability: during fast
-    // re-detection the window fills with track_cnt==1 features, so those stats
-    // collapse even though the camera sees plenty of well-distributed, RANSAC-
-    // consistent structure. The blind decision therefore keys ONLY on
-    // track-age-independent geometry: detectable points, coverage, RANSAC
-    // survivors. High-flow re-detection is explicitly protected.
-    const int detectable_pts =
-        snapshot.total_points > 0 ? snapshot.total_points : snapshot.image_points;
-    const int ransac_survivors = snapshot.tracked_after_ransac;
-    const bool fast_redetect =
-        snapshot.mean_pixel_flow > BLIND_FLOW_DYN &&
-        snapshot.coverage_ratio >= 0.6 &&
-        detectable_pts >= BLIND_PTS_OK &&
-        ransac_survivors >= BLIND_PTS_OK / 2;
-    const bool ransac_collapsed =
-        (snapshot.prev_points >= BLIND_PTS_OK) && (ransac_survivors < BLIND_PTS_BLIND);
-    const bool hard_reset_frame =
-        !fast_redetect &&
-        (detectable_pts < BLIND_PTS_MIN ||
-         snapshot.coverage_ratio < 0.35 ||
-         ransac_collapsed);
-    if (hard_reset_frame)
-        target = VISUAL_BLIND;
-
-    if (target == visual_state)
-    {
-        pending_count_ = 0;
-    }
-    else
-    {
-        if (target == pending_state_)
-            ++pending_count_;
-        else
-        {
-            pending_state_ = target;
-            pending_count_ = 1;
-        }
-
-        int need = 1;
-        if (hard_reset_frame)
-            need = 1;
-        else if (target == VISUAL_BLIND)
-            need = std::max(1, BLIND_DEBOUNCE_FRAMES);
-        else if (target == VISUAL_DEGRADED)
-            need = std::max(1, QUALITY_DEGRADED_DEBOUNCE);
-        else if (visual_state != VISUAL_HEALTHY)
-            need = std::max(3, BLIND_DEBOUNCE_FRAMES);
-        if (pending_count_ >= need)
-        {
-            const VisualState old = visual_state;
-            visual_state = target;
-            pending_count_ = 0;
-
-            if (visual_state == VISUAL_BLIND && old != VISUAL_BLIND)
-                enterBlind(header);
-            else if (old == VISUAL_BLIND && visual_state != VISUAL_BLIND)
-                exitBlind(header);
-
-            ROS_WARN("VINS visual state %d -> %d, pts=%d, tracks=%d, flow=%.1f, eig=%.3g, par=%.2f, cov=%.2f, qmed=%.2f, bad=%.2f, hq=%.2f, new=%.2f, photo=%.2f, mean=%.1f, dark=%.3f, sat=%.3f, blur=%.1f",
-                     static_cast<int>(old), static_cast<int>(visual_state),
-                     frontend_quality.total_points, visual_track_num,
-                     frontend_quality.mean_pixel_flow,
-                     frontend_quality.mean_track_eigen, visual_parallax,
-                     frontend_quality.coverage_ratio,
-                     snapshot.quality_median,
-                     snapshot.quality_bad_ratio,
-                     snapshot.high_quality_long_ratio,
-                     snapshot.new_feature_ratio,
-                     snapshot.photometric_health,
-                     snapshot.brightness_mean,
-                     snapshot.dark_ratio,
-                     snapshot.saturated_ratio,
-                     snapshot.blur_score);
-        }
-    }
-
-    if (visual_state == VISUAL_HEALTHY && blind_anchor_valid)
-    {
-        blind_anchor_valid = false;
-        blind_start_time = -1.0;
-    }
-}
-
-bool Estimator::isLowDynamic(int frame_index) const
-{
-    if (frame_index < 0 || frame_index > WINDOW_SIZE)
-        return false;
-    const vector<Vector3d> &acc_buf = linear_acceleration_buf[frame_index];
-    const vector<Vector3d> &gyr_buf = angular_velocity_buf[frame_index];
-    if (acc_buf.size() < 5 || gyr_buf.size() != acc_buf.size())
-        return false;
-
-    Vector3d mean_acc = Vector3d::Zero();
-    double mean_gyr_norm = 0.0;
-    for (size_t i = 0; i < acc_buf.size(); i++)
-    {
-        mean_acc += acc_buf[i];
-        mean_gyr_norm += gyr_buf[i].norm();
-    }
-    mean_acc /= static_cast<double>(acc_buf.size());
-    mean_gyr_norm /= static_cast<double>(gyr_buf.size());
-
-    double acc_var = 0.0;
-    for (size_t i = 0; i < acc_buf.size(); i++)
-        acc_var += (acc_buf[i] - mean_acc).squaredNorm();
-    acc_var /= static_cast<double>(acc_buf.size());
-
-    return acc_var < BLIND_ZUPT_MAX_ACC_VAR && mean_gyr_norm < BLIND_TILT_MAX_GYR &&
-           fabs(mean_acc.norm() - G.norm()) < BLIND_TILT_MAX_ACC_DEV;
-}
-
-bool Estimator::isGroundStatic(int frame_index) const
-{
-    if (!isLowDynamic(frame_index))
-        return false;
-    const vector<Vector3d> &gyr_buf = angular_velocity_buf[frame_index];
-    double mean_gyr_norm = 0.0;
-    for (size_t i = 0; i < gyr_buf.size(); i++)
-        mean_gyr_norm += gyr_buf[i].norm();
-    mean_gyr_norm /= static_cast<double>(gyr_buf.size());
-    return mean_gyr_norm < BLIND_ZUPT_MAX_GYR;
-}
-
-void Estimator::addBlindFactors(ceres::Problem &problem, ceres::LossFunction *loss_function)
-{
-    if (!BLIND_ENABLE || !USE_IMU || !blind_anchor_valid || !isBlind())
-        return;
-
-    const double current_time = Headers[frame_count];
-    const double t_blind = blindDuration(current_time);
-    const double relax_max = std::max(1.0, BLIND_BIAS_RELAX_MAX);
-    const double relax = std::min(relax_max, 1.0 + BLIND_BIAS_RELAX_RATE * t_blind);
-    Eigen::Matrix<double, 6, 6> sqrt_info = Eigen::Matrix<double, 6, 6>::Zero();
-    sqrt_info.block<3, 3>(0, 0) =
-        (1.0 / std::max(1e-6, BLIND_BIAS_ACC_SIGMA * relax)) * Eigen::Matrix3d::Identity();
-    sqrt_info.block<3, 3>(3, 3) =
-        (1.0 / std::max(1e-6, BLIND_BIAS_GYR_SIGMA * relax)) * Eigen::Matrix3d::Identity();
-
-    for (int i = 0; i <= frame_count; i++)
-    {
-        BiasPriorFactor *bias_factor = new BiasPriorFactor(blind_ba0, blind_bg0, sqrt_info);
-        problem.AddResidualBlock(bias_factor, loss_function, para_SpeedBias[i]);
-    }
-
-    if (BLIND_VELOCITY_PRIOR_WEIGHT > 0.0 && blind_v0.allFinite())
-    {
-        for (int i = 0; i <= frame_count; i++)
-        {
-            VelocityPriorFactor *velocity_factor =
-                new VelocityPriorFactor(blind_v0, BLIND_VELOCITY_PRIOR_WEIGHT);
-            problem.AddResidualBlock(velocity_factor, loss_function, para_SpeedBias[i]);
-        }
-    }
-
-    for (int i = 0; i <= frame_count; i++)
-    {
-        if (BLIND_TILT_WEIGHT > 0.0 && isLowDynamic(i))
-        {
-            Vector3d acc_mean = Vector3d::Zero();
-            for (size_t k = 0; k < linear_acceleration_buf[i].size(); k++)
-                acc_mean += linear_acceleration_buf[i][k];
-            acc_mean /= static_cast<double>(linear_acceleration_buf[i].size());
-            if (acc_mean.norm() > 1e-3)
-            {
-                acc_mean.normalize();
-                Vector3d g_unit = g.normalized();
-                problem.AddResidualBlock(GravityDirectionFactor::Create(g_unit, acc_mean, BLIND_TILT_WEIGHT),
-                                         loss_function, para_Pose[i]);
-            }
-        }
-
-        // Let IMU stationarity decide ZUPT gating. The estimated velocity can
-        // already be corrupted once drift starts, so it should not veto recovery.
-        if (BLIND_ZUPT_WEIGHT > 0.0 && isGroundStatic(i))
-        {
-            GroundZuptFactor *zupt_factor = new GroundZuptFactor(BLIND_ZUPT_WEIGHT);
-            problem.AddResidualBlock(zupt_factor, loss_function, para_SpeedBias[i]);
-        }
-    }
-
-    if (BLIND_THRUST_WEIGHT > 0.0)
-    {
-        for (int i = 0; i < frame_count; i++)
-        {
-            const double dt = Headers[i + 1] - Headers[i];
-            if (dt < BLIND_THRUST_MIN_DT)
-                continue;
-            double thrust_acc_i = getThrustAcc(Headers[i]);
-            double thrust_acc_j = getThrustAcc(Headers[i + 1]);
-            if (thrust_acc_i < 0.0 || thrust_acc_j < 0.0)
-                continue;
-            problem.AddResidualBlock(ThrustDynamicsFactor::Create(dt, thrust_acc_i,
-                                                                  thrust_acc_j, g,
-                                                                  BLIND_THRUST_WEIGHT),
-                                     loss_function,
-                                     para_Pose[i], para_SpeedBias[i],
-                                     para_Pose[i + 1], para_SpeedBias[i + 1]);
-        }
-    }
-}
-
-void Estimator::addNominalBiasPrior(ceres::Problem &problem, ceres::LossFunction *loss_function)
-{
-    if (!NOMINAL_BIAS_PRIOR_ENABLE || !USE_IMU || solver_flag != NON_LINEAR || isBlind())
-        return;
-
-    const double sigma_acc = std::max(1e-3, NOMINAL_ACC_BIAS_SIGMA);
-    Eigen::Matrix<double, 6, 6> sqrt_info = Eigen::Matrix<double, 6, 6>::Zero();
-    sqrt_info.block<3, 3>(0, 0) = (1.0 / sigma_acc) * Eigen::Matrix3d::Identity();
-
-    BiasPriorFactor *bias_factor =
-        new BiasPriorFactor(Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), sqrt_info);
-    problem.AddResidualBlock(bias_factor, nullptr, para_SpeedBias[frame_count]);
-}
-
-void Estimator::logDynamicsResiduals()
-{
-    if (!USE_IMU || solver_flag != NON_LINEAR || frame_count < 2)
-        return;
-
-    std::deque<std::pair<double, double>> thrust_buf;
-    {
-        std::lock_guard<std::mutex> lock(mThrust);
-        thrust_buf = thrustBuf;
-    }
-
-    int valid = 0;
-    int missing_thrust = 0;
-    int missing_imu = 0;
-    double sq_sum = 0.0;
-    double max_norm = 0.0;
-    Eigen::Vector3d mean_residual = Eigen::Vector3d::Zero();
-
-    for (int b = 1; b <= frame_count; ++b)
-    {
-        const int a = b - 1;
-        const std::vector<double> &dts = dt_buf[b];
-        const std::vector<Eigen::Vector3d> &gyrs = angular_velocity_buf[b];
-        if (dts.empty() || dts.size() != gyrs.size())
-        {
-            ++missing_imu;
-            continue;
-        }
-
-        Eigen::Matrix3d delta_R = Eigen::Matrix3d::Identity();
-        Eigen::Vector3d alpha = Eigen::Vector3d::Zero();
-        double sum_dt = 0.0;
-        double t = Headers[a];
-        bool ok = true;
-        for (size_t k = 0; k < dts.size(); ++k)
-        {
-            const double dt = dts[k];
-            if (!std::isfinite(dt) || dt <= 0.0 || dt > 0.05)
-            {
-                ok = false;
-                break;
-            }
-            const double thrust_acc = sampleThrustAcc(thrust_buf, t + 0.5 * dt);
-            if (thrust_acc < 0.0)
-            {
-                ok = false;
-                ++missing_thrust;
-                break;
-            }
-            alpha += delta_R * (thrust_acc * Eigen::Vector3d::UnitZ()) * dt;
-            const Eigen::Vector3d gyr_unbias = gyrs[k] - Bgs[a];
-            delta_R *= Utility::deltaQ(gyr_unbias * dt).toRotationMatrix();
-            t += dt;
-            sum_dt += dt;
-        }
-        if (!ok || sum_dt <= 0.0)
-            continue;
-
-        const Eigen::Vector3d pred_dv = Rs[a] * alpha - g * sum_dt;
-        const Eigen::Vector3d vio_dv = Vs[b] - Vs[a];
-        const Eigen::Vector3d residual = vio_dv - pred_dv;
-        const double norm = residual.norm();
-        mean_residual += residual;
-        sq_sum += norm * norm;
-        max_norm = std::max(max_norm, norm);
-        ++valid;
-    }
-
-    if (valid > 0)
-        mean_residual /= static_cast<double>(valid);
-    const double rms = valid > 0 ? std::sqrt(sq_sum / static_cast<double>(valid)) : -1.0;
-
-    ROS_WARN_THROTTLE(1.0,
-                      "[DYN-LOG] valid=%d missing_thrust=%d missing_imu=%d rms_dv=%.4f max_dv=%.4f mean=(%.4f %.4f %.4f)",
-                      valid, missing_thrust, missing_imu, rms, max_norm,
-                      mean_residual.x(), mean_residual.y(), mean_residual.z());
-}
-
-bool Estimator::clampBlindBiases()
-{
-    if (!BLIND_ENABLE || !USE_IMU || !isBlind())
-        return false;
-
-    const double acc_bias_max = std::max(0.1, BLIND_BIAS_ACC_MAX);
-    const double gyr_bias_max = std::max(0.01, BLIND_BIAS_GYR_MAX);
-    bool clamped = false;
-
-    for (int i = 0; i <= frame_count; i++)
-    {
-        if (!Bas[i].allFinite() || !Bgs[i].allFinite())
-            return false;
-
-        const double ba_norm = Bas[i].norm();
-        if (ba_norm > acc_bias_max)
-        {
-            Bas[i] *= acc_bias_max / ba_norm;
-            clamped = true;
-        }
-
-        const double bg_norm = Bgs[i].norm();
-        if (bg_norm > gyr_bias_max)
-        {
-            Bgs[i] *= gyr_bias_max / bg_norm;
-            clamped = true;
-        }
-    }
-
-    if (clamped)
-    {
-        ROS_WARN("VINS BLIND bias clamped: acc<=%.3f gyr<=%.3f",
-                 acc_bias_max, gyr_bias_max);
-        for (int i = 0; i <= frame_count; i++)
-        {
-            if (pre_integrations[i] != nullptr)
-                pre_integrations[i]->repropagate(Bas[i], Bgs[i]);
-        }
-        if (tmp_pre_integration != nullptr)
-            tmp_pre_integration->repropagate(Bas[frame_count], Bgs[frame_count]);
-    }
-
-    return clamped;
 }
 
 void Estimator::optimization()
@@ -2833,7 +1346,26 @@ void Estimator::optimization()
     TicToc t_whole, t_prepare;
     vector2double();
 
-    const bool visual_calibration_ok = (visual_state == VISUAL_HEALTHY);
+    static int nonlinear_optimization_age = 0;
+    if (solver_flag != NON_LINEAR)
+        nonlinear_optimization_age = 0;
+
+    SelectorFrameStat selector_stat;
+    selector_stat.mode = BACKEND_SELECTOR_MODE;
+    selector_stat.initialized = (solver_flag == NON_LINEAR);
+    selector_stat.frame_count = frame_count;
+    selector_stat.marginalization_flag = marginalization_flag;
+    selector_stat.shadow_enabled = backendSelectorCanShadow();
+    selector_stat.gate_enabled = backendSelectorCanGate(solver_flag, frame_count, nonlinear_optimization_age);
+    if (solver_flag == NON_LINEAR)
+        nonlinear_optimization_age++;
+    FrameDecision selector_decision;
+    if (selector_stat.shadow_enabled)
+    {
+        TicToc t_selector;
+        selector_decision = decideBackendSelector(f_manager, frame_count, marginalization_flag, &selector_stat);
+        selector_stat.selector_time_ms = t_selector.toc();
+    }
 
     ceres::Problem problem;
     ceres::LossFunction *loss_function;
@@ -2855,8 +1387,7 @@ void Estimator::optimization()
     {
         ceres::LocalParameterization *local_parameterization = new PoseLocalParameterization();
         problem.AddParameterBlock(para_Ex_Pose[i], SIZE_POSE, local_parameterization);
-        if (visual_calibration_ok &&
-            ((ESTIMATE_EXTRINSIC && frame_count == WINDOW_SIZE && Vs[0].norm() > 0.2) || openExEstimation))
+        if ((ESTIMATE_EXTRINSIC && frame_count == WINDOW_SIZE && Vs[0].norm() > 0.2) || openExEstimation)
         {
             //ROS_INFO("estimate extinsic param");
             openExEstimation = 1;
@@ -2869,7 +1400,7 @@ void Estimator::optimization()
     }
     problem.AddParameterBlock(para_Td[0], 1);
 
-    if (!visual_calibration_ok || !ESTIMATE_TD || Vs[0].norm() < 0.2)
+    if (!ESTIMATE_TD || Vs[0].norm() < 0.2)
         problem.SetParameterBlockConstant(para_Td[0]);
 
     if (last_marginalization_info && last_marginalization_info->valid)
@@ -2889,136 +1420,102 @@ void Estimator::optimization()
             IMUFactor* imu_factor = new IMUFactor(pre_integrations[j]);
             problem.AddResidualBlock(imu_factor, NULL, para_Pose[i], para_SpeedBias[i], para_Pose[j], para_SpeedBias[j]);
         }
-    }
-    addNominalBiasPrior(problem, loss_function);
-    addBlindFactors(problem, loss_function);
 
-    const bool visual_stationary = USE_IMU && isLowFlowStationary();
-    if (visual_stationary && LOW_FLOW_ZUPT_WEIGHT > 0.0)
-    {
-        const int window = std::max(1, LOW_FLOW_ZUPT_WINDOW);
-        const int start = std::max(0, frame_count - window + 1);
-        for (int i = start; i <= frame_count; i++)
+        // ===================== 零速约束 (ZUPT) 测试 =====================
+        // 仅在滑窗已经填满 (frame_count == WINDOW_SIZE) 时给最新帧加 V=0 约束
+        // weight 越大约束越硬; 先用 100.0, 实测后再调
+        // !! 当前为强制每次都加, 用于验证因子本身工作; 后续应加 IMU 静止检测再启用
+        if (frame_count == WINDOW_SIZE)
         {
-            GroundZuptFactor *flow_zupt = new GroundZuptFactor(LOW_FLOW_ZUPT_WEIGHT);
-            problem.AddResidualBlock(flow_zupt, loss_function, para_SpeedBias[i]);
+            const double zupt_weight = 100;
+            ZeroVelocityFactor *zupt_factor = new ZeroVelocityFactor(zupt_weight);
+            problem.AddResidualBlock(zupt_factor, NULL,
+                                     para_SpeedBias[frame_count]);
         }
-        ROS_WARN_THROTTLE(1.0, "VINS low-flow ZUPT active: flow=%.3f tracks=%d keep=%.2f vel=%.2f",
-                          latest_frontend_quality_.mean_pixel_flow,
-                          latest_frontend_quality_.tracked_after_lk,
-                          latest_frontend_quality_.lk_keep_ratio,
-                          Vs[frame_count].norm());
+        // ==============================================================
     }
 
     int f_m_cnt = 0;
     int feature_index = -1;
-    const std::vector<char> good_feature_mask = selectGoodFeatures();
-    const double state_visual_weight =
-        isBlind() ? 0.0 :
-        (isVisualDegraded() ? std::min(0.25, BLIND_VISUAL_WEIGHT_DEGRADED) : 1.0);
-    auto visualScale = [state_visual_weight](double qi, double qj)
-    {
-        return clampVisualWeight(state_visual_weight * std::sqrt(std::max(0.05, qi) * std::max(0.05, qj)));
-    };
     for (auto &it_per_id : f_manager.feature)
+    {
+        it_per_id.used_num = it_per_id.feature_per_frame.size();
+        if (it_per_id.used_num < 4)
+            continue;
+ 
+        ++feature_index;
+
+        int imu_i = it_per_id.start_frame, imu_j = imu_i - 1;
+        const FeatureDecision *feature_decision = selector_decision.findFeature(it_per_id.feature_id);
+        const bool gate_feature =
+            selector_stat.gate_enabled && feature_decision != nullptr && !feature_decision->use_feature;
+        if (gate_feature)
+            continue;
+        
+        Vector3d pts_i = it_per_id.feature_per_frame[0].point;
+        int obs_idx = -1;
+
+        for (auto &it_per_frame : it_per_id.feature_per_frame)
         {
-            if (!featureReadyForOptimization(it_per_id))
-                continue;
-     
-            ++feature_index;
-            if (isBlind())
-                continue;
-            const bool keep_feature =
-                good_feature_mask.empty() ||
-                (feature_index >= 0 && feature_index < static_cast<int>(good_feature_mask.size()) &&
-                 good_feature_mask[feature_index]);
-            if (!keep_feature)
+            imu_j++;
+            obs_idx++;
+            const bool shadow_cut =
+                feature_decision != nullptr &&
+                (obs_idx >= static_cast<int>(feature_decision->obs.size()) ||
+                 !feature_decision->obs[obs_idx].use);
+            if (shadow_cut)
+                selector_stat.actual_visual_obs_shadow_cut++;
+            if (selector_stat.gate_enabled && shadow_cut)
                 continue;
 
-            if (!std::isfinite(para_Feature[feature_index][0]))
-                para_Feature[feature_index][0] = 1.0 / std::max(INIT_DEPTH, 1.0);
-            para_Feature[feature_index][0] =
-                std::min(std::max(para_Feature[feature_index][0], kInvDepthMin), kInvDepthMax);
-            problem.AddParameterBlock(para_Feature[feature_index], SIZE_FEATURE);
-            problem.SetParameterLowerBound(para_Feature[feature_index], 0, kInvDepthMin);
-            problem.SetParameterUpperBound(para_Feature[feature_index], 0, kInvDepthMax);
-
-            int imu_i = it_per_id.start_frame, imu_j = imu_i - 1;
-            
-            Vector3d pts_i = it_per_id.feature_per_frame[0].point;
-            const double quality_i = it_per_id.feature_per_frame[0].quality;
-            // If a feature has many observations, subsample redundant ones by parallax.
-            const int max_obs = 20; // keep at most this many observations per feature
-            int obs_n = static_cast<int>(it_per_id.feature_per_frame.size());
-            std::vector<char> keep(obs_n, 1);
-            if (obs_n > max_obs)
+            bool added_obs_factor = false;
+            if (imu_i != imu_j)
             {
-                // compute parallax wrt first observation and select top-k
-                std::vector<std::pair<double, int>> scores; scores.reserve(obs_n - 1);
-                for (int idx = 1; idx < obs_n; ++idx)
-                {
-                    Vector3d pts_j = it_per_id.feature_per_frame[idx].point;
-                    double parallax = (pts_i.head<2>() - pts_j.head<2>()).norm();
-                    scores.emplace_back(parallax, idx);
-                }
-                std::sort(scores.begin(), scores.end(),
-                          [](const std::pair<double, int> &a, const std::pair<double, int> &b)
-                          {
-                              return a.first > b.first;
-                          });
-                // keep first (anchor) and top (max_obs-1) others
-                std::fill(keep.begin(), keep.end(), 0);
-                keep[0] = 1;
-                int to_keep = std::min(max_obs - 1, static_cast<int>(scores.size()));
-                for (int k = 0; k < to_keep; ++k)
-                    keep[scores[k].second] = 1;
+                Vector3d pts_j = it_per_frame.point;
+                ProjectionTwoFrameOneCamFactor *f_td = new ProjectionTwoFrameOneCamFactor(pts_i, pts_j, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocity,
+                                                                 it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
+                problem.AddResidualBlock(f_td, loss_function, para_Pose[imu_i], para_Pose[imu_j], para_Ex_Pose[0], para_Feature[feature_index], para_Td[0]);
+                selector_stat.actual_visual_factor_added++;
+                selector_stat.actual_visual_two_frame_one_cam++;
+                added_obs_factor = true;
             }
 
-            int frame_idx = 0;
-            for (auto &it_per_frame : it_per_id.feature_per_frame)
-            {
-                // skip observation if we decided not to keep it
-                if (!keep[frame_idx]) { imu_j++; frame_idx++; continue; }
-                imu_j++;
-                if (imu_i != imu_j)
+            if(STEREO && it_per_frame.is_stereo)
+            {                
+                Vector3d pts_j_right = it_per_frame.pointRight;
+                if(imu_i != imu_j)
                 {
-                    Vector3d pts_j = it_per_frame.point;
-                    const double scale = visualScale(quality_i, it_per_frame.quality);
-                    ProjectionTwoFrameOneCamFactor *f_td = new ProjectionTwoFrameOneCamFactor(pts_i, pts_j, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocity,
-                                                                     it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td, scale);
-                    problem.AddResidualBlock(f_td, loss_function, para_Pose[imu_i], para_Pose[imu_j], para_Ex_Pose[0], para_Feature[feature_index], para_Td[0]);
+                    ProjectionTwoFrameTwoCamFactor *f = new ProjectionTwoFrameTwoCamFactor(pts_i, pts_j_right, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocityRight,
+                                                                 it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
+                    problem.AddResidualBlock(f, loss_function, para_Pose[imu_i], para_Pose[imu_j], para_Ex_Pose[0], para_Ex_Pose[1], para_Feature[feature_index], para_Td[0]);
+                    selector_stat.actual_visual_factor_added++;
+                    selector_stat.actual_visual_two_frame_two_cam++;
+                    added_obs_factor = true;
                 }
-
-                if(STEREO && it_per_frame.is_stereo)
-                {                
-                    Vector3d pts_j_right = it_per_frame.pointRight;
-                    const double scale = visualScale(quality_i, it_per_frame.qualityRight);
-                    if(imu_i != imu_j)
-                    {
-                        ProjectionTwoFrameTwoCamFactor *f = new ProjectionTwoFrameTwoCamFactor(pts_i, pts_j_right, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocityRight,
-                                                                     it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td, scale);
-                        problem.AddResidualBlock(f, loss_function, para_Pose[imu_i], para_Pose[imu_j], para_Ex_Pose[0], para_Ex_Pose[1], para_Feature[feature_index], para_Td[0]);
-                    }
-                    else
-                    {
-                        ProjectionOneFrameTwoCamFactor *f = new ProjectionOneFrameTwoCamFactor(pts_i, pts_j_right, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocityRight,
-                                                                     it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td, scale);
-                        problem.AddResidualBlock(f, loss_function, para_Ex_Pose[0], para_Ex_Pose[1], para_Feature[feature_index], para_Td[0]);
-                    }
-                   
+                else
+                {
+                    ProjectionOneFrameTwoCamFactor *f = new ProjectionOneFrameTwoCamFactor(pts_i, pts_j_right, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocityRight,
+                                                                 it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
+                    problem.AddResidualBlock(f, loss_function, para_Ex_Pose[0], para_Ex_Pose[1], para_Feature[feature_index], para_Td[0]);
+                    selector_stat.actual_visual_factor_added++;
+                    selector_stat.actual_visual_one_frame_two_cam++;
+                    added_obs_factor = true;
                 }
-                f_m_cnt++;
-                frame_idx++;
+               
             }
+            if (added_obs_factor)
+                selector_stat.actual_visual_obs_added++;
+            f_m_cnt++;
         }
+    }
 
     ROS_DEBUG("visual measurement count: %d", f_m_cnt);
     //printf("prepare for ceres: %f \n", t_prepare.toc());
 
     ceres::Solver::Options options;
 
-    options.linear_solver_type = isBlind() ? ceres::DENSE_QR : ceres::DENSE_SCHUR;
-    options.num_threads = 2;
+    options.linear_solver_type = ceres::DENSE_SCHUR;
+    //options.num_threads = 2;
     options.trust_region_strategy_type = ceres::DOGLEG;
     options.max_num_iterations = NUM_ITERATIONS;
     //options.use_explicit_schur_complement = true;
@@ -3031,17 +1528,21 @@ void Estimator::optimization()
     TicToc t_solver;
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
+    selector_stat.solver_time_ms = t_solver.toc();
+    selector_stat.ceres_iterations = static_cast<int>(summary.iterations.size());
+    selector_stat.final_cost = summary.final_cost;
     //cout << summary.BriefReport() << endl;
     ROS_DEBUG("Iterations : %d", static_cast<int>(summary.iterations.size()));
     //printf("solver costs: %f \n", t_solver.toc());
 
     double2vector();
-    clampBlindBiases();
-    logDynamicsResiduals();
     //printf("frame_count: %d \n", frame_count);
 
     if(frame_count < WINDOW_SIZE)
+    {
+        writeSelectorStat(selector_stat);
         return;
+    }
     
     TicToc t_whole_marginalization;
     if (marginalization_flag == MARGIN_OLD)
@@ -3080,62 +1581,76 @@ void Estimator::optimization()
 
         {
             int feature_index = -1;
-            const std::vector<char> good_feature_mask = selectGoodFeatures();
             for (auto &it_per_id : f_manager.feature)
             {
-                if (!featureReadyForOptimization(it_per_id))
+                it_per_id.used_num = it_per_id.feature_per_frame.size();
+                if (it_per_id.used_num < 4)
                     continue;
 
                 ++feature_index;
-                const bool keep_feature =
-                    good_feature_mask.empty() ||
-                    (feature_index >= 0 && feature_index < static_cast<int>(good_feature_mask.size()) &&
-                     good_feature_mask[feature_index]);
-                if (!keep_feature)
-                    continue;
 
                 int imu_i = it_per_id.start_frame, imu_j = imu_i - 1;
                 if (imu_i != 0)
                     continue;
 
                 Vector3d pts_i = it_per_id.feature_per_frame[0].point;
-                const double quality_i = it_per_id.feature_per_frame[0].quality;
+                const FeatureDecision *feature_decision = selector_decision.findFeature(it_per_id.feature_id);
+                int obs_idx = -1;
 
                 for (auto &it_per_frame : it_per_id.feature_per_frame)
                 {
                     imu_j++;
+                    obs_idx++;
+                    if (selector_stat.gate_enabled && !selector_decision.useObs(it_per_id.feature_id, obs_idx))
+                        continue;
+                    bool added_obs_factor = false;
                     if(imu_i != imu_j)
                     {
                         Vector3d pts_j = it_per_frame.point;
-                        const double scale = visualScale(quality_i, it_per_frame.quality);
                         ProjectionTwoFrameOneCamFactor *f_td = new ProjectionTwoFrameOneCamFactor(pts_i, pts_j, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocity,
-                                                                          it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td, scale);
+                                                                          it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
                         ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(f_td, loss_function,
                                                                                         vector<double *>{para_Pose[imu_i], para_Pose[imu_j], para_Ex_Pose[0], para_Feature[feature_index], para_Td[0]},
                                                                                         vector<int>{0, 3});
                         marginalization_info->addResidualBlockInfo(residual_block_info);
+                        selector_stat.marg_visual_factor_added++;
+                        added_obs_factor = true;
                     }
                     if(STEREO && it_per_frame.is_stereo)
                     {
                         Vector3d pts_j_right = it_per_frame.pointRight;
-                        const double scale = visualScale(quality_i, it_per_frame.qualityRight);
                         if(imu_i != imu_j)
                         {
                             ProjectionTwoFrameTwoCamFactor *f = new ProjectionTwoFrameTwoCamFactor(pts_i, pts_j_right, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocityRight,
-                                                                          it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td, scale);
+                                                                          it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
                             ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(f, loss_function,
                                                                                            vector<double *>{para_Pose[imu_i], para_Pose[imu_j], para_Ex_Pose[0], para_Ex_Pose[1], para_Feature[feature_index], para_Td[0]},
                                                                                            vector<int>{0, 4});
                             marginalization_info->addResidualBlockInfo(residual_block_info);
+                            selector_stat.marg_visual_factor_added++;
+                            added_obs_factor = true;
                         }
                         else
                         {
                             ProjectionOneFrameTwoCamFactor *f = new ProjectionOneFrameTwoCamFactor(pts_i, pts_j_right, it_per_id.feature_per_frame[0].velocity, it_per_frame.velocityRight,
-                                                                          it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td, scale);
+                                                                          it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
                             ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(f, loss_function,
                                                                                            vector<double *>{para_Ex_Pose[0], para_Ex_Pose[1], para_Feature[feature_index], para_Td[0]},
                                                                                            vector<int>{2});
                             marginalization_info->addResidualBlockInfo(residual_block_info);
+                            selector_stat.marg_visual_factor_added++;
+                            added_obs_factor = true;
+                        }
+                    }
+                    if (added_obs_factor)
+                    {
+                        selector_stat.marg_visual_obs_added++;
+                        if (feature_decision != nullptr &&
+                            obs_idx >= 0 &&
+                            obs_idx < static_cast<int>(feature_decision->obs.size()) &&
+                            feature_decision->obs[obs_idx].reason == ObsUseReason::MARGINALIZATION_PIN)
+                        {
+                            selector_stat.marg_pinned_obs++;
                         }
                     }
                 }
@@ -3240,6 +1755,7 @@ void Estimator::optimization()
     }
     //printf("whole marginalization costs: %f \n", t_whole_marginalization.toc());
     //printf("whole time for ceres: %f \n", t_whole.toc());
+    writeSelectorStat(selector_stat);
 }
 
 void Estimator::slideWindow()
@@ -3292,19 +1808,8 @@ void Estimator::slideWindow()
             {
                 map<double, ImageFrame>::iterator it_0;
                 it_0 = all_image_frame.find(t_0);
-                if (it_0 != all_image_frame.end())
-                {
-                    if (it_0->second.pre_integration != nullptr)
-                    {
-                        delete it_0->second.pre_integration;
-                        it_0->second.pre_integration = nullptr;
-                    }
-                    all_image_frame.erase(all_image_frame.begin(), it_0);
-                }
-                else
-                {
-                    ROS_WARN("slideWindow missing image frame %.9f during marginalization", t_0);
-                }
+                delete it_0->second.pre_integration;
+                all_image_frame.erase(all_image_frame.begin(), it_0);
             }
             slideWindowOld();
         }
@@ -3390,13 +1895,14 @@ void Estimator::getPoseInWorldFrame(int index, Eigen::Matrix4d &T)
 
 void Estimator::predictPtsInNextFrame()
 {
+    //printf("predict pts in next frame\n");
     if(frame_count < 2)
         return;
+    // predict next pose. Assume constant velocity motion
     Eigen::Matrix4d curT, prevT, nextT;
     getPoseInWorldFrame(curT);
     getPoseInWorldFrame(frame_count - 1, prevT);
     nextT = curT * (prevT.inverse() * curT);
-
     map<int, Eigen::Vector3d> predictPts;
 
     for (auto &it_per_id : f_manager.feature)
@@ -3422,19 +1928,13 @@ void Estimator::predictPtsInNextFrame()
     //printf("estimator output %d predict pts\n",(int)predictPts.size());
 }
 
-double Estimator::reprojectionError(const Matrix3d &Ri, const Vector3d &Pi, const Matrix3d &rici, const Vector3d &tici,
-                                 const Matrix3d &Rj, const Vector3d &Pj, const Matrix3d &ricj, const Vector3d &ticj, 
-                                 double depth, const Vector3d &uvi, const Vector3d &uvj) const
+double Estimator::reprojectionError(Matrix3d &Ri, Vector3d &Pi, Matrix3d &rici, Vector3d &tici,
+                                 Matrix3d &Rj, Vector3d &Pj, Matrix3d &ricj, Vector3d &ticj, 
+                                 double depth, Vector3d &uvi, Vector3d &uvj)
 {
-    if (!std::isfinite(depth) || depth <= 0.0)
-        return std::numeric_limits<double>::infinity();
     Vector3d pts_w = Ri * (rici * (depth * uvi) + tici) + Pi;
     Vector3d pts_cj = ricj.transpose() * (Rj.transpose() * (pts_w - Pj) - ticj);
-    if (!pts_cj.allFinite() || pts_cj.z() <= 1e-3)
-        return std::numeric_limits<double>::infinity();
     Vector2d residual = (pts_cj / pts_cj.z()).head<2>() - uvj.head<2>();
-    if (!residual.allFinite())
-        return std::numeric_limits<double>::infinity();
     double rx = residual.x();
     double ry = residual.y();
     return sqrt(rx * rx + ry * ry);
@@ -3448,7 +1948,8 @@ void Estimator::outliersRejection(set<int> &removeIndex)
     {
         double err = 0;
         int errCnt = 0;
-        if (!featureReadyForOptimization(it_per_id))
+        it_per_id.used_num = it_per_id.feature_per_frame.size();
+        if (it_per_id.used_num < 4)
             continue;
         feature_index ++;
         int imu_i = it_per_id.start_frame, imu_j = imu_i - 1;
@@ -3492,17 +1993,7 @@ void Estimator::outliersRejection(set<int> &removeIndex)
                 }       
             }
         }
-        if (errCnt == 0)
-        {
-            removeIndex.insert(it_per_id.feature_id);
-            continue;
-        }
         double ave_err = err / errCnt;
-        if (!std::isfinite(ave_err))
-        {
-            removeIndex.insert(it_per_id.feature_id);
-            continue;
-        }
         if(ave_err * FOCAL_LENGTH > 3)
             removeIndex.insert(it_per_id.feature_id);
 
@@ -3511,36 +2002,11 @@ void Estimator::outliersRejection(set<int> &removeIndex)
 
 void Estimator::fastPredictIMU(double t, Eigen::Vector3d linear_acceleration, Eigen::Vector3d angular_velocity)
 {
-    if (!std::isfinite(latest_time) || latest_time <= 0.0)
-    {
-        latest_time = t;
-        latest_acc_0 = linear_acceleration;
-        latest_gyr_0 = angular_velocity;
-        return;
-    }
     double dt = t - latest_time;
-    if (!std::isfinite(dt) || dt <= 0.0 || dt > 0.05)
-    {
-        latest_time = t;
-        latest_acc_0 = linear_acceleration;
-        latest_gyr_0 = angular_velocity;
-        ROS_WARN_THROTTLE(1.0, "skip abnormal propagate dt: %.6f at t=%.6f", dt, t);
-        return;
-    }
     latest_time = t;
     Eigen::Vector3d un_acc_0 = latest_Q * (latest_acc_0 - latest_Ba) - g;
     Eigen::Vector3d un_gyr = 0.5 * (latest_gyr_0 + angular_velocity) - latest_Bg;
     latest_Q = latest_Q * Utility::deltaQ(un_gyr * dt);
-    latest_Q.normalize();
-    if (isLowFlowStationary())
-    {
-        if (low_flow_lock_active_)
-            latest_P = low_flow_lock_P_;
-        latest_V.setZero();
-        latest_acc_0 = linear_acceleration;
-        latest_gyr_0 = angular_velocity;
-        return;
-    }
     Eigen::Vector3d un_acc_1 = latest_Q * (linear_acceleration - latest_Ba) - g;
     Eigen::Vector3d un_acc = 0.5 * (un_acc_0 + un_acc_1);
     latest_P = latest_P + dt * latest_V + 0.5 * dt * dt * un_acc;
@@ -3556,12 +2022,6 @@ void Estimator::updateLatestStates()
     latest_P = Ps[frame_count];
     latest_Q = Rs[frame_count];
     latest_V = Vs[frame_count];
-    if (isLowFlowStationary())
-    {
-        if (low_flow_lock_active_)
-            latest_P = low_flow_lock_P_;
-        latest_V.setZero();
-    }
     latest_Ba = Bas[frame_count];
     latest_Bg = Bgs[frame_count];
     latest_acc_0 = acc_0;
