@@ -11,7 +11,7 @@
 
 #include "initial_alignment.h"
 
-bool solveGyroscopeBias(map<double, ImageFrame> &all_image_frame, Vector3d* Bgs)
+void solveGyroscopeBias(map<double, ImageFrame> &all_image_frame, Vector3d* Bgs)
 {
     Matrix3d A;
     Vector3d b;
@@ -33,31 +33,8 @@ bool solveGyroscopeBias(map<double, ImageFrame> &all_image_frame, Vector3d* Bgs)
         A += tmp_A.transpose() * tmp_A;
         b += tmp_A.transpose() * tmp_b;
     }
-    Eigen::SelfAdjointEigenSolver<Matrix3d> eig(A);
-    if (eig.info() != Eigen::Success)
-    {
-        ROS_WARN("gyroscope bias init reject: eigen decomposition failed");
-        return false;
-    }
-    const double min_sv = std::max(0.0, eig.eigenvalues()(0));
-    const double max_sv = std::max(0.0, eig.eigenvalues()(2));
-    const double cond = max_sv / std::max(min_sv, 1e-12);
-    if (min_sv < 1e-8 || cond > 1e8)
-    {
-        ROS_WARN("gyroscope bias init reject: ill-conditioned A min_sv=%.3e max_sv=%.3e cond=%.3e",
-                 min_sv, max_sv, cond);
-        return false;
-    }
     delta_bg = A.ldlt().solve(b);
-    if (!delta_bg.allFinite() || delta_bg.norm() > 0.2)
-    {
-        ROS_WARN("gyroscope bias init reject: invalid delta_bg %.6f %.6f %.6f norm=%.6f",
-                 delta_bg.x(), delta_bg.y(), delta_bg.z(), delta_bg.norm());
-        return false;
-    }
     ROS_WARN_STREAM("gyroscope bias initial calibration " << delta_bg.transpose());
-    ROS_WARN("gyroscope bias init spectral check: min_sv=%.3e max_sv=%.3e cond=%.3e delta_norm=%.6f",
-             min_sv, max_sv, cond, delta_bg.norm());
 
     for (int i = 0; i <= WINDOW_SIZE; i++)
         Bgs[i] += delta_bg;
@@ -67,7 +44,6 @@ bool solveGyroscopeBias(map<double, ImageFrame> &all_image_frame, Vector3d* Bgs)
         frame_j = next(frame_i);
         frame_j->second.pre_integration->repropagate(Vector3d::Zero(), Bgs[0]);
     }
-    return true;
 }
 
 
@@ -232,8 +208,7 @@ bool LinearAlignment(map<double, ImageFrame> &all_image_frame, Vector3d &g, Vect
 
 bool VisualIMUAlignment(map<double, ImageFrame> &all_image_frame, Vector3d* Bgs, Vector3d &g, VectorXd &x)
 {
-    if (!solveGyroscopeBias(all_image_frame, Bgs))
-        return false;
+    solveGyroscopeBias(all_image_frame, Bgs);
 
     if(LinearAlignment(all_image_frame, g, x))
         return true;

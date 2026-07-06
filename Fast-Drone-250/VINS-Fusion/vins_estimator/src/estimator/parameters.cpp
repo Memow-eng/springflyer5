@@ -52,6 +52,17 @@ int BACKEND_LANDMARK_BUDGET = 100;
 int BACKEND_MAX_OBS_PER_FEATURE = 4;
 int BACKEND_SELECTOR_MIN_TOTAL_OBS = 250;
 int BACKEND_SELECTOR_MIN_TRACK_LEN = 8;
+int Z_DRIFT_STATE_LOG_ENABLE = 0;
+int FRONTEND_GRID_FEATURE_ENABLE = 1;
+int FRONTEND_GRID_COLS = 12;
+int FRONTEND_GRID_ROWS = 8;
+int FRONTEND_GRID_MAX_PER_CELL = 2;
+double FRONTEND_GRID_QUALITY = 0.05;
+double FRONTEND_FB_THRESHOLD = 0.5;
+double FRONTEND_MIN_EIG = 0.0;
+double FRONTEND_LOW_TEX_COVERAGE = 0.35;
+int BACKEND_FEATURE_FATE_SIDECAR_LOG_ENABLE = 0;
+int BACKEND_FEATURE_OBSERVABILITY_SIDECAR_LOG_ENABLE = 0;
 
 
 template <typename T>
@@ -110,6 +121,17 @@ void readParameters(std::string config_file)
     readOptionalParam(fsSettings, "backend_max_obs_per_feature", BACKEND_MAX_OBS_PER_FEATURE);
     readOptionalParam(fsSettings, "backend_selector_min_total_obs", BACKEND_SELECTOR_MIN_TOTAL_OBS);
     readOptionalParam(fsSettings, "backend_selector_min_track_len", BACKEND_SELECTOR_MIN_TRACK_LEN);
+    readOptionalParam(fsSettings, "z_drift_state_log_enable", Z_DRIFT_STATE_LOG_ENABLE);
+    readOptionalParam(fsSettings, "frontend_grid_feature_enable", FRONTEND_GRID_FEATURE_ENABLE);
+    readOptionalParam(fsSettings, "frontend_grid_cols", FRONTEND_GRID_COLS);
+    readOptionalParam(fsSettings, "frontend_grid_rows", FRONTEND_GRID_ROWS);
+    readOptionalParam(fsSettings, "frontend_grid_max_per_cell", FRONTEND_GRID_MAX_PER_CELL);
+    readOptionalParam(fsSettings, "frontend_grid_quality", FRONTEND_GRID_QUALITY);
+    readOptionalParam(fsSettings, "frontend_fb_threshold", FRONTEND_FB_THRESHOLD);
+    readOptionalParam(fsSettings, "frontend_min_eig", FRONTEND_MIN_EIG);
+    readOptionalParam(fsSettings, "frontend_low_tex_coverage", FRONTEND_LOW_TEX_COVERAGE);
+    readOptionalParam(fsSettings, "backend_feature_fate_sidecar_log_enable", BACKEND_FEATURE_FATE_SIDECAR_LOG_ENABLE);
+    readOptionalParam(fsSettings, "backend_feature_observability_sidecar_log_enable", BACKEND_FEATURE_OBSERVABILITY_SIDECAR_LOG_ENABLE);
 
     MULTIPLE_THREAD = fsSettings["multiple_thread"];
 

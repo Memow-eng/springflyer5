@@ -19,6 +19,8 @@
 #include "../utility/utility.h"
 #include "../utility/tic_toc.h"
 
+const int NUM_THREADS = 4;
+
 struct ResidualBlockInfo
 {
     ResidualBlockInfo(ceres::CostFunction *_cost_function, ceres::LossFunction *_loss_function, std::vector<double *> _parameter_blocks, std::vector<int> _drop_set)

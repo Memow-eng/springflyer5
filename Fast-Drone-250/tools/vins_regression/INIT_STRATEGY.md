@@ -19,8 +19,7 @@ Initialization is intentionally reduced toward a small, inspectable pipeline:
 5. Commit sanity: accept only if reprojection and solved state checks are safe.
 
 Runtime low-flow handling is no longer allowed to hard-write estimator state.
-Low-flow may still be logged and may optionally add a soft velocity ZUPT factor,
-but the default weight is `0.0`.
+Low-flow may still be logged, but it must not add estimator state constraints.
 
 ## Current active mechanisms
 
@@ -31,8 +30,7 @@ but the default weight is `0.0`.
   retry counter and is not logged as a WARN.
 - Post-solve reprojection and state sanity checks.
 - Runtime nominal bias prior remains enabled by default.
-- Low-flow stationary cue remains enabled, but only logs by default because
-  `low_flow_zupt_weight` is `0.0`.
+- Low-flow stationary cue remains logging-only.
 
 ## Removed, disabled, or retired mechanisms
 

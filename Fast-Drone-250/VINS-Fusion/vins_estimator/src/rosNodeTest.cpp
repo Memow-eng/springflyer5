@@ -17,7 +17,6 @@
 #include <ros/ros.h>
 #include <cv_bridge/cv_bridge.h>
 #include <opencv2/opencv.hpp>
-#include <mavros_msgs/AttitudeTarget.h>
 #include "estimator/estimator.h"
 #include "estimator/parameters.h"
 #include "utility/visualization.h"
@@ -127,7 +126,7 @@ void sync_process()
                 estimator.inputImage(time, image);
         }
 
-        std::chrono::milliseconds dura(IMAGE_SYNC_SLEEP_MS);
+        std::chrono::milliseconds dura(2);
         std::this_thread::sleep_for(dura);
     }
 }
@@ -148,16 +147,10 @@ void imu_callback(const sensor_msgs::ImuConstPtr &imu_msg)
     return;
 }
 
-void thrust_callback(const mavros_msgs::AttitudeTarget::ConstPtr &msg)
-{
-    double t = msg->header.stamp.toSec();
-    estimator.inputThrust(t, msg->thrust);
-}
-
 
 void feature_callback(const sensor_msgs::PointCloudConstPtr &feature_msg)
 {
-    map<int, vector<pair<int, FeatureObservation>>> featureFrame;
+    map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> featureFrame;
     for (unsigned int i = 0; i < feature_msg->points.size(); i++)
     {
         int feature_id = feature_msg->channels[0].values[i];
@@ -178,8 +171,8 @@ void feature_callback(const sensor_msgs::PointCloudConstPtr &feature_msg)
             //printf("receive pts gt %d %f %f %f\n", feature_id, gx, gy, gz);
         }
         ROS_ASSERT(z == 1);
-        FeatureObservation xyz_uv_velocity;
-        xyz_uv_velocity << x, y, z, p_u, p_v, velocity_x, velocity_y, 1.0;
+        Eigen::Matrix<double, 7, 1> xyz_uv_velocity;
+        xyz_uv_velocity << x, y, z, p_u, p_v, velocity_x, velocity_y;
         featureFrame[feature_id].emplace_back(camera_id,  xyz_uv_velocity);
     }
     double t = feature_msg->header.stamp.toSec();
@@ -246,8 +239,6 @@ int main(int argc, char **argv)
     printf("config_file: %s\n", argv[1]);
 
     readParameters(config_file);
-    if (OPENCV_NUM_THREADS > 0)
-        cv::setNumThreads(OPENCV_NUM_THREADS);
     estimator.setParameter();
 
 #ifdef EIGEN_DONT_PARALLELIZE
@@ -270,7 +261,6 @@ int main(int argc, char **argv)
     {
         sub_img1 = n.subscribe(IMAGE1_TOPIC, 100, img1_callback);
     }
-    ros::Subscriber sub_thrust = n.subscribe("/mavros/setpoint_raw/attitude", 100, thrust_callback);
     ros::Subscriber sub_restart = n.subscribe("/vins_restart", 100, restart_callback);
     ros::Subscriber sub_imu_switch = n.subscribe("/vins_imu_switch", 100, imu_switch_callback);
     ros::Subscriber sub_cam_switch = n.subscribe("/vins_cam_switch", 100, cam_switch_callback);

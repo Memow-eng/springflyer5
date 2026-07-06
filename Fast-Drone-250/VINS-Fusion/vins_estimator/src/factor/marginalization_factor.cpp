@@ -8,8 +8,6 @@
  *******************************************************/
 
 #include "marginalization_factor.h"
-#include "../estimator/parameters.h"
-#include <algorithm>
 
 void ResidualBlockInfo::Evaluate()
 {
@@ -246,18 +244,16 @@ void MarginalizationInfo::marginalize()
 
 
     TicToc t_thread_summing;
-    const int factor_count = static_cast<int>(factors.size());
-    const int thread_count = std::max(1, std::min(MARGINALIZATION_NUM_THREADS, std::max(1, factor_count)));
-    std::vector<pthread_t> tids(thread_count);
-    std::vector<ThreadsStruct> threadsstruct(thread_count);
+    pthread_t tids[NUM_THREADS];
+    ThreadsStruct threadsstruct[NUM_THREADS];
     int i = 0;
     for (auto it : factors)
     {
         threadsstruct[i].sub_factors.push_back(it);
         i++;
-        i = i % thread_count;
+        i = i % NUM_THREADS;
     }
-    for (int i = 0; i < thread_count; i++)
+    for (int i = 0; i < NUM_THREADS; i++)
     {
         TicToc zero_matrix;
         threadsstruct[i].A = Eigen::MatrixXd::Zero(pos,pos);
@@ -271,7 +267,7 @@ void MarginalizationInfo::marginalize()
             ROS_BREAK();
         }
     }
-    for( int i = thread_count - 1; i >= 0; i--)  
+    for( int i = NUM_THREADS - 1; i >= 0; i--)  
     {
         pthread_join( tids[i], NULL ); 
         A += threadsstruct[i].A;

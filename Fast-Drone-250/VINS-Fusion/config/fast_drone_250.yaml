@@ -56,12 +56,29 @@ flow_back: 1            # perform forward and backward optical flow to improve f
 
 # Backend observation selector.
 # 0 = off/original, 1 = log only, 2 = gate visual factors after initialization warmup.
-backend_selector_mode: 2
+backend_selector_mode: 1
 backend_selector_warmup_frames: 10
 backend_landmark_budget: 100      # legacy; conservative compression mode does not drop whole landmarks
 backend_max_obs_per_feature: 4
 backend_selector_min_total_obs: 500
 backend_selector_min_track_len: 8
+z_drift_state_log_enable: 1
+# Frontend new-feature distribution. Existing tracked features are never removed by this block.
+frontend_grid_feature_enable: 1
+frontend_grid_cols: 12
+frontend_grid_rows: 8
+frontend_grid_max_per_cell: 2
+frontend_grid_quality: 0.05
+frontend_fb_threshold: 0.5
+# Absolute Shi-Tomasi response floor. 0 = off (response-ordered budget only).
+# Raise to reject globally-weak corners instead of forcing cells to fill.
+frontend_min_eig: 0.0
+# Read-only low-texture warning threshold on grid coverage ratio [0..1].
+# Below this, the debug image shows LOW-TEX and the run logs a throttled WARN.
+# It does NOT fabricate points; the estimator leans on the IMU. 0 = off.
+frontend_low_tex_coverage: 0.35
+backend_feature_fate_sidecar_log_enable: 0
+backend_feature_observability_sidecar_log_enable: 1
 
 #optimization parameters
 max_solver_time: 0.04 # max solver itration time (ms), to guarantee real time

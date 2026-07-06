@@ -11,19 +11,14 @@
 
 #include "projectionTwoFrameTwoCamFactor.h"
 
-#include <algorithm>
-#include <cmath>
-
 Eigen::Matrix2d ProjectionTwoFrameTwoCamFactor::sqrt_info;
 double ProjectionTwoFrameTwoCamFactor::sum_t;
 
 ProjectionTwoFrameTwoCamFactor::ProjectionTwoFrameTwoCamFactor(const Eigen::Vector3d &_pts_i, const Eigen::Vector3d &_pts_j,
                                                                const Eigen::Vector2d &_velocity_i, const Eigen::Vector2d &_velocity_j,
-                                                               const double _td_i, const double _td_j,
-                                                               const double _scale) : 
+                                                               const double _td_i, const double _td_j) : 
                                                                pts_i(_pts_i), pts_j(_pts_j), 
-                                                               td_i(_td_i), td_j(_td_j),
-                                                               visual_scale(std::max(0.0, std::min(1.0, _scale)))
+                                                               td_i(_td_i), td_j(_td_j)
 {
     velocity_i.x() = _velocity_i.x();
     velocity_i.y() = _velocity_i.y();
@@ -61,9 +56,6 @@ bool ProjectionTwoFrameTwoCamFactor::Evaluate(double const *const *parameters, d
     Eigen::Quaterniond qic2(parameters[3][6], parameters[3][3], parameters[3][4], parameters[3][5]);
 
     double inv_dep_i = parameters[4][0];
-    if (!std::isfinite(inv_dep_i))
-        inv_dep_i = 1.0 / std::max(1.0, INIT_DEPTH);
-    inv_dep_i = std::max(1.0 / 100.0, std::min(10.0, inv_dep_i));
 
     double td = parameters[5][0];
 
@@ -82,30 +74,10 @@ bool ProjectionTwoFrameTwoCamFactor::Evaluate(double const *const *parameters, d
     residual =  tangent_base * (pts_camera_j.normalized() - pts_j_td.normalized());
 #else
     double dep_j = pts_camera_j.z();
-    if (!std::isfinite(dep_j) || dep_j <= 1e-6)
-    {
-        residual.setZero();
-        if (jacobians)
-        {
-            if (jacobians[0])
-                Eigen::Map<Eigen::Matrix<double, 2, 7, Eigen::RowMajor>>(jacobians[0]).setZero();
-            if (jacobians[1])
-                Eigen::Map<Eigen::Matrix<double, 2, 7, Eigen::RowMajor>>(jacobians[1]).setZero();
-            if (jacobians[2])
-                Eigen::Map<Eigen::Matrix<double, 2, 7, Eigen::RowMajor>>(jacobians[2]).setZero();
-            if (jacobians[3])
-                Eigen::Map<Eigen::Matrix<double, 2, 7, Eigen::RowMajor>>(jacobians[3]).setZero();
-            if (jacobians[4])
-                Eigen::Map<Eigen::Vector2d>(jacobians[4]).setZero();
-            if (jacobians[5])
-                Eigen::Map<Eigen::Vector2d>(jacobians[5]).setZero();
-        }
-        return true;
-    }
     residual = (pts_camera_j / dep_j).head<2>() - pts_j_td.head<2>();
 #endif
 
-    residual = visual_scale * sqrt_info * residual;
+    residual = sqrt_info * residual;
 
     if (jacobians)
     {
@@ -129,7 +101,7 @@ bool ProjectionTwoFrameTwoCamFactor::Evaluate(double const *const *parameters, d
         reduce << 1. / dep_j, 0, -pts_camera_j(0) / (dep_j * dep_j),
             0, 1. / dep_j, -pts_camera_j(1) / (dep_j * dep_j);
 #endif
-        reduce = visual_scale * sqrt_info * reduce;
+        reduce = sqrt_info * reduce;
 
         if (jacobians[0])
         {

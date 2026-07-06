@@ -11,176 +11,196 @@
 
 #include "feature_tracker.h"
 #include <algorithm>
-#include <fstream>   // ===== FEATURE LOGGING (added) =====
-#include <cstring>   // ===== FEATURE LOGGING (added) =====
+#include <fstream>
+#include <iomanip>
 
-// ===================== FEATURE LOGGING (added for distribution analysis) =====================
-// 输出每帧"最终送进后端的"左相机特征点 (经过 光流 + 前后向 + setMask + 补点 之后).
-//   1) CSV : 每点一行  t,id,u,v,track_cnt   -> 事后用 Python 画 数量/空间分布/寿命
-//   2) 终端: 每 N 帧打印一次网格热力, 实时粗看空间分布是否病态
-// 不改动任何原有跟踪逻辑, 纯旁路记录.
 namespace
 {
-const int   FEAT_GRID_R      = 6;   // 网格行数
-const int   FEAT_GRID_C      = 8;   // 网格列数
-
-void logFeatureStats(double t,
-                     const std::vector<cv::Point2f> &pts,
-                     const std::vector<int> &ids,
-                     const std::vector<int> &track_cnt,
-                     int row, int col)
+int gridIdForPoint(const cv::Point2f &p, int width, int height, int grid_cols, int grid_rows)
 {
-    if (!FEATURE_LOG_ENABLE)
-        return;
-
-    static int frame_cnt = 0;
-    frame_cnt++;
-
-    // ---- CSV: 每个点一行 ----
-    static std::ofstream fout;
-    static bool inited = false;
-    if (!inited)
-    {
-        fout.open(FEATURE_LOG_PATH, std::ios::out | std::ios::trunc);
-        if (fout.is_open())
-            fout << "t,id,u,v,track_cnt\n";
-        else
-            printf("[FT][WARN] cannot open %s for logging\n", FEATURE_LOG_PATH.c_str());
-        inited = true;
-    }
-    if (fout.is_open())
-    {
-        fout.setf(std::ios::fixed);
-        for (size_t i = 0; i < pts.size() && i < ids.size() && i < track_cnt.size(); i++)
-            fout << t << "," << ids[i] << ","
-                 << pts[i].x << "," << pts[i].y << ","
-                 << track_cnt[i] << "\n";
-        if (FEATURE_LOG_FLUSH_EVERY <= 1 || frame_cnt % FEATURE_LOG_FLUSH_EVERY == 0)
-            fout.flush();
-    }
-
-    // ---- 终端网格热力 ----
-    if (row <= 0 || col <= 0)
-        return;
-
-    int grid[FEAT_GRID_R][FEAT_GRID_C];
-    memset(grid, 0, sizeof(grid));
-    int cell_h = std::max(1, row / FEAT_GRID_R);
-    int cell_w = std::max(1, col / FEAT_GRID_C);
-    for (const auto &p : pts)
-    {
-        int gr = std::min((int)(p.y / cell_h), FEAT_GRID_R - 1);
-        int gc = std::min((int)(p.x / cell_w), FEAT_GRID_C - 1);
-        if (gr < 0 || gc < 0)
-            continue;
-        grid[gr][gc]++;
-    }
-    int empty_cells = 0, max_cell = 0;
-    for (int r = 0; r < FEAT_GRID_R; r++)
-        for (int c = 0; c < FEAT_GRID_C; c++)
-        {
-            if (grid[r][c] == 0)
-                empty_cells++;
-            max_cell = std::max(max_cell, grid[r][c]);
-        }
-
-    const int print_every = std::max(1, FEATURE_LOG_PRINT_EVERY);
-    if (frame_cnt % print_every == 0)
-    {
-        // total / 空格子数(越大分布越差) / 最满格子点数(越大越扎堆)
-        printf("[FT] total=%zu  empty_cells=%d/%d  max_cell=%d  grid:\n",
-               pts.size(), empty_cells, FEAT_GRID_R * FEAT_GRID_C, max_cell);
-        for (int r = 0; r < FEAT_GRID_R; r++)
-        {
-            printf("[FT]   ");
-            for (int c = 0; c < FEAT_GRID_C; c++)
-                printf("%3d ", grid[r][c]);
-            printf("\n");
-        }
-    }
+    const int safe_width = std::max(1, width);
+    const int safe_height = std::max(1, height);
+    const int safe_cols = std::max(1, grid_cols);
+    const int safe_rows = std::max(1, grid_rows);
+    int cx = static_cast<int>(p.x * safe_cols / safe_width);
+    int cy = static_cast<int>(p.y * safe_rows / safe_height);
+    cx = std::max(0, std::min(cx, safe_cols - 1));
+    cy = std::max(0, std::min(cy, safe_rows - 1));
+    return cy * safe_cols + cx;
 }
 
-double clampUnitLocal(double value)
+struct FrontendCoverageStats
 {
-    return std::max(0.0, std::min(1.0, value));
-}
+    int grid_cols = 0;
+    int grid_rows = 0;
+    int total_cells = 0;
+    int tracked_count = 0;
+    int new_count = 0;
+    int total_count = 0;
+    int occupied_cells = 0;
+    int tracked_occupied_cells = 0;
+    int new_occupied_cells = 0;
+    int bottom_total_count = 0;
+    int bottom_tracked_count = 0;
+    int bottom_new_count = 0;
+    int low_motion_total_count = 0;
+    int low_motion_tracked_count = 0;
+    int low_motion_new_count = 0;
+    int max_cell_count = 0;
+    int min_nonzero_cell_count = 0;
+    double coverage_ratio = 0.0;
+    double tracked_coverage_ratio = 0.0;
+    double new_coverage_ratio = 0.0;
+    double bottom_total_ratio = 0.0;
+    double bottom_tracked_ratio = 0.0;
+    double bottom_new_ratio = 0.0;
+    double low_motion_total_ratio = 0.0;
+    double low_motion_tracked_ratio = 0.0;
+    double low_motion_new_ratio = 0.0;
+};
 
-void computePhotometricQuality(const cv::Mat &img, FrontendQuality &quality)
+FrontendCoverageStats computeCoverageStats(const std::vector<cv::Point2f> &tracked_pts,
+                                           const std::vector<cv::Point2f> &new_pts,
+                                           const std::vector<int> &tracked_ids,
+                                           const std::map<int, cv::Point2f> &prev_pts_by_id,
+                                           int width,
+                                           int height,
+                                           int configured_cols,
+                                           int configured_rows)
 {
-    if (img.empty())
-        return;
+    FrontendCoverageStats stats;
+    stats.grid_cols = std::max(1, std::min(configured_cols, std::max(1, width)));
+    stats.grid_rows = std::max(1, std::min(configured_rows, std::max(1, height)));
+    stats.total_cells = stats.grid_cols * stats.grid_rows;
+    stats.tracked_count = static_cast<int>(tracked_pts.size());
+    stats.new_count = static_cast<int>(new_pts.size());
+    stats.total_count = stats.tracked_count + stats.new_count;
 
-    cv::Mat gray;
-    if (img.channels() == 1)
-        gray = img;
-    else
-        cv::cvtColor(img, gray, cv::COLOR_BGR2GRAY);
-    if (gray.depth() != CV_8U)
-        gray.convertTo(gray, CV_8U);
+    std::vector<int> total_cells(stats.total_cells, 0);
+    std::vector<int> tracked_cells(stats.total_cells, 0);
+    std::vector<int> new_cells(stats.total_cells, 0);
 
-    cv::Scalar mean, stddev;
-    cv::meanStdDev(gray, mean, stddev);
-    quality.brightness_mean = mean[0];
-    quality.contrast_std = stddev[0];
+    const double bottom_y = 0.70 * std::max(1, height);
+    const double low_motion_px = std::max(1.0, 0.25 * MIN_DIST);
 
-    int dark_cnt = 0;
-    int sat_cnt = 0;
-    const int total = gray.rows * gray.cols;
-    for (int r = 0; r < gray.rows; r++)
+    for (size_t i = 0; i < tracked_pts.size(); ++i)
     {
-        const uchar *ptr = gray.ptr<uchar>(r);
-        for (int c = 0; c < gray.cols; c++)
+        const cv::Point2f &p = tracked_pts[i];
+        const int gid = gridIdForPoint(p, width, height, stats.grid_cols, stats.grid_rows);
+        total_cells[gid]++;
+        tracked_cells[gid]++;
+        if (p.y >= bottom_y)
+            stats.bottom_tracked_count++;
+        if (i < tracked_ids.size())
         {
-            const uchar v = ptr[c];
-            dark_cnt += v <= 10 ? 1 : 0;
-            sat_cnt += v >= 245 ? 1 : 0;
+            const auto prev_it = prev_pts_by_id.find(tracked_ids[i]);
+            if (prev_it != prev_pts_by_id.end() && cv::norm(p - prev_it->second) <= low_motion_px)
+                stats.low_motion_tracked_count++;
         }
     }
-    quality.dark_ratio = total > 0 ? static_cast<double>(dark_cnt) / static_cast<double>(total) : 0.0;
-    quality.saturated_ratio = total > 0 ? static_cast<double>(sat_cnt) / static_cast<double>(total) : 0.0;
+    for (const auto &p : new_pts)
+    {
+        const int gid = gridIdForPoint(p, width, height, stats.grid_cols, stats.grid_rows);
+        total_cells[gid]++;
+        new_cells[gid]++;
+        if (p.y >= bottom_y)
+            stats.bottom_new_count++;
+    }
 
-    cv::Mat lap;
-    cv::Laplacian(gray, lap, CV_64F, 3);
-    cv::Scalar lap_mean, lap_stddev;
-    cv::meanStdDev(lap, lap_mean, lap_stddev);
-    quality.blur_score = lap_stddev[0] * lap_stddev[0];
+    stats.bottom_total_count = stats.bottom_tracked_count + stats.bottom_new_count;
+    stats.low_motion_new_count = stats.new_count;
+    stats.low_motion_total_count = stats.low_motion_tracked_count + stats.low_motion_new_count;
 
-    const double exposure_health = 1.0 - std::max(quality.dark_ratio, quality.saturated_ratio);
-    const double contrast_health = clampUnitLocal(quality.contrast_std / 35.0);
-    const double blur_health = clampUnitLocal(quality.blur_score / 120.0);
-    quality.photometric_health = clampUnitLocal(0.45 * exposure_health + 0.25 * contrast_health + 0.30 * blur_health);
+    stats.min_nonzero_cell_count = stats.total_count > 0 ? stats.total_count : 0;
+    for (int i = 0; i < stats.total_cells; ++i)
+    {
+        if (total_cells[i] > 0)
+        {
+            stats.occupied_cells++;
+            stats.max_cell_count = std::max(stats.max_cell_count, total_cells[i]);
+            stats.min_nonzero_cell_count = std::min(stats.min_nonzero_cell_count, total_cells[i]);
+        }
+        if (tracked_cells[i] > 0)
+            stats.tracked_occupied_cells++;
+        if (new_cells[i] > 0)
+            stats.new_occupied_cells++;
+    }
+
+    if (stats.total_cells > 0)
+    {
+        stats.coverage_ratio = static_cast<double>(stats.occupied_cells) / stats.total_cells;
+        stats.tracked_coverage_ratio = static_cast<double>(stats.tracked_occupied_cells) / stats.total_cells;
+        stats.new_coverage_ratio = static_cast<double>(stats.new_occupied_cells) / stats.total_cells;
+    }
+    if (stats.total_count > 0)
+    {
+        stats.bottom_total_ratio = static_cast<double>(stats.bottom_total_count) / stats.total_count;
+        stats.low_motion_total_ratio = static_cast<double>(stats.low_motion_total_count) / stats.total_count;
+    }
+    if (stats.tracked_count > 0)
+    {
+        stats.bottom_tracked_ratio = static_cast<double>(stats.bottom_tracked_count) / stats.tracked_count;
+        stats.low_motion_tracked_ratio = static_cast<double>(stats.low_motion_tracked_count) / stats.tracked_count;
+    }
+    if (stats.new_count > 0)
+    {
+        stats.bottom_new_ratio = static_cast<double>(stats.bottom_new_count) / stats.new_count;
+        stats.low_motion_new_ratio = static_cast<double>(stats.low_motion_new_count) / stats.new_count;
+    }
+
+    return stats;
 }
-} // anonymous namespace
-// ===================== end FEATURE LOGGING =====================
 
-FrontendQuality::FrontendQuality()
-    : prev_points(0),
-      tracked_after_lk(0),
-      tracked_after_ransac(0),
-      new_points(0),
-      total_points(0),
-      occupied_cells(0),
-      grid_cols(0),
-      grid_rows(0),
-      lk_keep_ratio(1.0),
-      mean_lk_error(-1.0),
-      mean_fb_error(-1.0),
-      mean_track_eigen(-1.0),
-      mean_pixel_flow(0.0),
-      coverage_ratio(0.0),
-      brightness_mean(-1.0),
-      dark_ratio(0.0),
-      saturated_ratio(0.0),
-      contrast_std(0.0),
-      blur_score(0.0),
-      photometric_health(1.0),
-      low_tracking_quality(false),
-      weak_texture(false),
-      poor_distribution(false),
-      ransac_rejected(false),
-      low_parallax(false)
+void writeFrontendCoverageSidecar(double timestamp,
+                                  const FrontendCoverageStats &stats,
+                                  bool grid_feature_enabled)
 {
+    if (OUTPUT_FOLDER.empty())
+        return;
+
+    const std::string path = OUTPUT_FOLDER + "/frontend_coverage_stats.csv";
+    static bool header_written = false;
+    std::ofstream out(path.c_str(), std::ios::app);
+    if (!out.is_open())
+        return;
+
+    if (!header_written)
+    {
+        out << "timestamp,grid_feature_enabled,grid_cols,grid_rows,total_cells,total_count,tracked_count,new_count,occupied_cells,coverage_ratio,tracked_occupied_cells,tracked_coverage_ratio,new_occupied_cells,new_coverage_ratio,bottom_total_count,bottom_total_ratio,bottom_tracked_count,bottom_tracked_ratio,bottom_new_count,bottom_new_ratio,low_motion_total_count,low_motion_total_ratio,low_motion_tracked_count,low_motion_tracked_ratio,low_motion_new_count,low_motion_new_ratio,min_nonzero_cell_count,max_cell_count\n";
+        header_written = true;
+    }
+
+    out << std::fixed << std::setprecision(9)
+        << timestamp << ','
+        << (grid_feature_enabled ? 1 : 0) << ','
+        << stats.grid_cols << ','
+        << stats.grid_rows << ','
+        << stats.total_cells << ','
+        << stats.total_count << ','
+        << stats.tracked_count << ','
+        << stats.new_count << ','
+        << stats.occupied_cells << ','
+        << stats.coverage_ratio << ','
+        << stats.tracked_occupied_cells << ','
+        << stats.tracked_coverage_ratio << ','
+        << stats.new_occupied_cells << ','
+        << stats.new_coverage_ratio << ','
+        << stats.bottom_total_count << ','
+        << stats.bottom_total_ratio << ','
+        << stats.bottom_tracked_count << ','
+        << stats.bottom_tracked_ratio << ','
+        << stats.bottom_new_count << ','
+        << stats.bottom_new_ratio << ','
+        << stats.low_motion_total_count << ','
+        << stats.low_motion_total_ratio << ','
+        << stats.low_motion_tracked_count << ','
+        << stats.low_motion_tracked_ratio << ','
+        << stats.low_motion_new_count << ','
+        << stats.low_motion_new_ratio << ','
+        << stats.min_nonzero_cell_count << ','
+        << stats.max_cell_count << '\n';
 }
+} // namespace
 
 bool FeatureTracker::inBorder(const cv::Point2f &pt)
 {
@@ -221,14 +241,10 @@ FeatureTracker::FeatureTracker()
     stereo_cam = 0;
     n_id = 0;
     hasPrediction = false;
-    relative_rotation_.setIdentity();
-    last_quality = FrontendQuality();
-}
-
-void FeatureTracker::setRelativeRotation(const Eigen::Matrix3d &R_cur_prev_cam)
-{
-    if (R_cur_prev_cam.allFinite())
-        relative_rotation_ = R_cur_prev_cam;
+    last_total_feature_count_ = 0;
+    last_tracked_feature_count_ = 0;
+    last_new_feature_count_ = 0;
+    last_grid_coverage_ratio_ = 0.0;
 }
 
 void FeatureTracker::setMask()
@@ -262,91 +278,75 @@ void FeatureTracker::setMask()
     }
 }
 
-void FeatureTracker::addAdaptiveCorners(int need_cnt)
+void FeatureTracker::extractGridFeatures()
 {
-    if (need_cnt <= 0)
+    n_pts.clear();
+    const int total_need = MAX_CNT - static_cast<int>(cur_pts.size());
+    if (total_need <= 0 || cur_img.empty() || mask.empty())
         return;
 
-    const double qualities[3] = {0.01, FRONTEND_LOW_QUALITY, FRONTEND_MIN_QUALITY};
-    const int base_min_dist = std::max(5, MIN_DIST);
-    const int low_min_dist = std::max(5, static_cast<int>(MIN_DIST * FRONTEND_DEGRADED_MIN_DIST_RATIO));
-
-    for (int pass = 0; pass < 3 && static_cast<int>(n_pts.size()) < need_cnt; pass++)
+    if (!FRONTEND_GRID_FEATURE_ENABLE)
     {
-        const int min_dist = pass == 0 ? base_min_dist : low_min_dist;
-        vector<cv::Point2f> tmp_pts;
-        int remain = need_cnt - static_cast<int>(n_pts.size());
-        cv::goodFeaturesToTrack(cur_img, tmp_pts, remain, qualities[pass], min_dist, mask);
-
-        for (auto &p : tmp_pts)
-        {
-            if (!inBorder(p))
-                continue;
-            if (mask.at<uchar>(p) == 0)
-                continue;
-            n_pts.push_back(p);
-            cv::circle(mask, p, min_dist, 0, -1);
-            if (static_cast<int>(n_pts.size()) >= need_cnt)
-                break;
-        }
-    }
-}
-
-void FeatureTracker::addGradientFeatures(int need_cnt)
-{
-    if (need_cnt <= 0 || cur_img.empty() || mask.empty())
+        cv::goodFeaturesToTrack(cur_img, n_pts, total_need, 0.01, MIN_DIST, mask);
         return;
-
-    cv::Mat eig;
-    cv::cornerMinEigenVal(cur_img, eig, 3, 3);
-
-    double global_max = 0.0;
-    cv::minMaxLoc(eig, nullptr, &global_max, nullptr, nullptr, mask);
-
-    const double thresh = std::max(static_cast<double>(FRONTEND_GRADIENT_MIN),
-                                   FRONTEND_MIN_QUALITY * global_max);
-
-    struct Candidate
-    {
-        cv::Point2f pt;
-        float score;
-    };
-    vector<Candidate> candidates;
-
-    const int grid = std::max(8, FRONTEND_GRADIENT_GRID);
-    for (int y = 0; y < row; y += grid)
-    {
-        for (int x = 0; x < col; x += grid)
-        {
-            cv::Rect roi(x, y, std::min(grid, col - x), std::min(grid, row - y));
-            if (roi.width <= 0 || roi.height <= 0)
-                continue;
-            double mv = 0.0;
-            cv::Point ml;
-            cv::minMaxLoc(eig(roi), nullptr, &mv, nullptr, &ml, mask(roi));
-            if (mv < thresh)
-                continue;
-            cv::Point2f p(static_cast<float>(x + ml.x), static_cast<float>(y + ml.y));
-            if (inBorder(p))
-                candidates.push_back({p, static_cast<float>(mv)});
-        }
     }
 
-    std::sort(candidates.begin(), candidates.end(),
-              [](const Candidate &a, const Candidate &b)
-              {
-                  return a.score > b.score;
-              });
+    const int grid_cols = std::max(1, std::min(FRONTEND_GRID_COLS, std::max(1, col)));
+    const int grid_rows = std::max(1, std::min(FRONTEND_GRID_ROWS, std::max(1, row)));
+    const int max_per_cell = std::max(1, FRONTEND_GRID_MAX_PER_CELL);
+    const double quality = FRONTEND_GRID_QUALITY > 0.0 ? FRONTEND_GRID_QUALITY : 0.01;
+    const int n_cells = grid_cols * grid_rows;
 
-    const int md = std::max(5, static_cast<int>(MIN_DIST * FRONTEND_DEGRADED_MIN_DIST_RATIO));
-    for (auto &c : candidates)
+    if (static_cast<int>(grid_cnt_.size()) != n_cells)
+        grid_cnt_.assign(n_cells, 0);
+    else
+        std::fill(grid_cnt_.begin(), grid_cnt_.end(), 0);
+
+    // Count already-tracked points per cell so cells that setMask already
+    // populated with long-lived features are not topped up with new corners.
+    for (const auto &p : cur_pts)
     {
-        if (static_cast<int>(n_pts.size()) >= need_cnt)
-            break;
-        if (mask.at<uchar>(c.pt) == 0)
+        if (!inBorder(p))
             continue;
-        n_pts.push_back(c.pt);
-        cv::circle(mask, c.pt, md, 0, -1);
+        const int gid = gridIdForPoint(p, col, row, grid_cols, grid_rows);
+        grid_cnt_[gid]++;
+    }
+
+    // One global detection over the whole image. goodFeaturesToTrack returns
+    // corners sorted by Shi-Tomasi response (strongest first) and enforces
+    // MIN_DIST across the entire frame via the shared mask, so there is no
+    // per-ROI boundary clumping and strong-texture regions are preferred.
+    // We over-request (2x budget) so that after per-cell capping we still have
+    // enough candidates to fill the frame, without lowering the quality floor.
+    cell_pts_.clear();
+    const int request = std::min(4 * MAX_CNT, std::max(total_need, 2 * MAX_CNT));
+    cv::goodFeaturesToTrack(cur_img, cell_pts_, request, quality, MIN_DIST, mask, 3, false, 0.04);
+
+    // Absolute Shi-Tomasi response floor: reject globally-weak corners outright
+    // instead of forcing every cell to fill. When FRONTEND_MIN_EIG <= 0 this is
+    // a no-op and behaviour is response-ordered budget only.
+    std::vector<float> eig;
+    if (FRONTEND_MIN_EIG > 0.0 && !cell_pts_.empty())
+        cv::cornerMinEigenVal(cur_img, min_eig_map_, 3);
+
+    n_pts.reserve(total_need);
+    for (const auto &p : cell_pts_)
+    {
+        if (static_cast<int>(n_pts.size()) >= total_need)
+            break;
+        if (!inBorder(p) || mask.at<uchar>(p) == 0)
+            continue;
+        if (FRONTEND_MIN_EIG > 0.0 &&
+            min_eig_map_.at<float>(cvRound(p.y), cvRound(p.x)) < FRONTEND_MIN_EIG)
+            continue;
+
+        const int gid = gridIdForPoint(p, col, row, grid_cols, grid_rows);
+        if (grid_cnt_[gid] >= max_per_cell)
+            continue;
+
+        n_pts.push_back(p);
+        grid_cnt_[gid]++;
+        cv::circle(mask, p, MIN_DIST, 0, -1);
     }
 }
 
@@ -358,13 +358,11 @@ double FeatureTracker::distance(cv::Point2f &pt1, cv::Point2f &pt2)
     return sqrt(dx * dx + dy * dy);
 }
 
-map<int, vector<pair<int, FeatureObservation>>> FeatureTracker::trackImage(double _cur_time, const cv::Mat &_img, const cv::Mat &_img1)
+map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> FeatureTracker::trackImage(double _cur_time, const cv::Mat &_img, const cv::Mat &_img1)
 {
     TicToc t_r;
-    last_quality = FrontendQuality();
     cur_time = _cur_time;
     cur_img = _img;
-    computePhotometricQuality(cur_img, last_quality);
     row = cur_img.rows;
     col = cur_img.cols;
     cv::Mat rightImg = _img1;
@@ -377,18 +375,16 @@ map<int, vector<pair<int, FeatureObservation>>> FeatureTracker::trackImage(doubl
     }
     */
     cur_pts.clear();
-    n_pts.clear();
 
     if (prev_pts.size() > 0)
     {
         TicToc t_o;
         vector<uchar> status;
         vector<float> err;
-        last_quality.prev_points = static_cast<int>(prev_pts.size());
         if(hasPrediction)
         {
             cur_pts = predict_pts;
-            cv::calcOpticalFlowPyrLK(prev_img, cur_img, prev_pts, cur_pts, status, err, cv::Size(21, 21), 3, 
+            cv::calcOpticalFlowPyrLK(prev_img, cur_img, prev_pts, cur_pts, status, err, cv::Size(21, 21), 1, 
             cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 30, 0.01), cv::OPTFLOW_USE_INITIAL_FLOW);
             
             int succ_num = 0;
@@ -399,7 +395,7 @@ map<int, vector<pair<int, FeatureObservation>>> FeatureTracker::trackImage(doubl
             }
             if (succ_num < 10)
                cv::calcOpticalFlowPyrLK(prev_img, cur_img, prev_pts, cur_pts, status, err, cv::Size(21, 21), 3);
-        }   
+        }
         else
             cv::calcOpticalFlowPyrLK(prev_img, cur_img, prev_pts, cur_pts, status, err, cv::Size(21, 21), 3);
         // reverse check
@@ -412,7 +408,10 @@ map<int, vector<pair<int, FeatureObservation>>> FeatureTracker::trackImage(doubl
             //cv::calcOpticalFlowPyrLK(cur_img, prev_img, cur_pts, reverse_pts, reverse_status, err, cv::Size(21, 21), 3); 
             for(size_t i = 0; i < status.size(); i++)
             {
-                if(status[i] && reverse_status[i] && distance(prev_pts[i], reverse_pts[i]) <= 0.5)
+                double fb_error = -1.0;
+                if(status[i] && reverse_status[i])
+                    fb_error = distance(prev_pts[i], reverse_pts[i]);
+                if(status[i] && reverse_status[i] && fb_error <= FRONTEND_FB_THRESHOLD)
                 {
                     status[i] = 1;
                 }
@@ -424,26 +423,6 @@ map<int, vector<pair<int, FeatureObservation>>> FeatureTracker::trackImage(doubl
         for (int i = 0; i < int(cur_pts.size()); i++)
             if (status[i] && !inBorder(cur_pts[i]))
                 status[i] = 0;
-        int kept_cnt = 0;
-        double flow_sum = 0.0;
-        int flow_cnt = 0;
-        for (int i = 0; i < int(cur_pts.size()) && i < int(prev_pts.size()) && i < int(status.size()); i++)
-        {
-            if (!status[i])
-                continue;
-            flow_sum += distance(prev_pts[i], cur_pts[i]);
-            flow_cnt++;
-        }
-        for (uchar s : status)
-            kept_cnt += s ? 1 : 0;
-        last_quality.tracked_after_lk = kept_cnt;
-        last_quality.mean_pixel_flow = flow_cnt > 0 ? flow_sum / static_cast<double>(flow_cnt) : 0.0;
-        last_quality.lk_keep_ratio = last_quality.prev_points > 0
-                                         ? static_cast<double>(kept_cnt) / static_cast<double>(last_quality.prev_points)
-                                         : 1.0;
-        last_quality.low_tracking_quality =
-            last_quality.prev_points >= FRONTEND_QUALITY_MIN_TRACKED &&
-            last_quality.lk_keep_ratio < FRONTEND_MIN_LK_KEEP_RATIO;
         reduceVector(prev_pts, status);
         reduceVector(cur_pts, status);
         reduceVector(ids, status);
@@ -472,17 +451,17 @@ map<int, vector<pair<int, FeatureObservation>>> FeatureTracker::trackImage(doubl
                 cout << "mask is empty " << endl;
             if (mask.type() != CV_8UC1)
                 cout << "mask type wrong " << endl;
-            if (FRONTEND_ADAPTIVE_FEATURE)
-                addAdaptiveCorners(n_max_cnt);
-            else
-                cv::goodFeaturesToTrack(cur_img, n_pts, n_max_cnt, 0.01, MIN_DIST, mask);
-
-            if (FRONTEND_GRADIENT_POINTS && static_cast<int>(cur_pts.size() + n_pts.size()) < MAX_CNT)
-                addGradientFeatures(MAX_CNT - static_cast<int>(cur_pts.size()));
+            extractGridFeatures();
         }
         else
             n_pts.clear();
         ROS_DEBUG("detect feature costs: %f ms", t_t.toc());
+
+        const std::vector<cv::Point2f> tracked_pts_before_new = cur_pts;
+        const std::vector<int> tracked_ids_before_new = ids;
+        const std::map<int, cv::Point2f> prev_pts_by_id_for_coverage = prevLeftPtsMap;
+        const int tracked_count_before_new = static_cast<int>(cur_pts.size());
+        const int new_count_added = static_cast<int>(n_pts.size());
 
         for (auto &p : n_pts)
         {
@@ -490,54 +469,25 @@ map<int, vector<pair<int, FeatureObservation>>> FeatureTracker::trackImage(doubl
             ids.push_back(n_id++);
             track_cnt.push_back(1);
         }
-        last_quality.new_points = static_cast<int>(n_pts.size());
-        last_quality.tracked_after_ransac = static_cast<int>(cur_pts.size());
-        last_quality.total_points = static_cast<int>(cur_pts.size());
-        if (!cur_pts.empty() && !cur_img.empty())
-        {
-            cv::Mat eig;
-            cv::cornerMinEigenVal(cur_img, eig, 3, 3);
-            double eig_sum = 0.0;
-            int eig_num = 0;
-            for (const auto &p : cur_pts)
-            {
-                int x = cvRound(p.x);
-                int y = cvRound(p.y);
-                if (0 <= x && x < eig.cols && 0 <= y && y < eig.rows)
-                {
-                    eig_sum += eig.at<float>(y, x);
-                    eig_num++;
-                }
-            }
-            if (eig_num > 0)
-                last_quality.mean_track_eigen = eig_sum / static_cast<double>(eig_num);
-        }
-        last_quality.grid_rows = std::max(1, FRONTEND_QUALITY_GRID_ROWS);
-        last_quality.grid_cols = std::max(1, FRONTEND_QUALITY_GRID_COLS);
-        if (row > 0 && col > 0)
-        {
-            vector<uchar> occupied(last_quality.grid_rows * last_quality.grid_cols, 0);
-            for (const auto &p : cur_pts)
-            {
-                int gx = std::min(last_quality.grid_cols - 1,
-                                  std::max(0, static_cast<int>(p.x * last_quality.grid_cols / col)));
-                int gy = std::min(last_quality.grid_rows - 1,
-                                  std::max(0, static_cast<int>(p.y * last_quality.grid_rows / row)));
-                occupied[gy * last_quality.grid_cols + gx] = 1;
-            }
-            for (uchar s : occupied)
-                last_quality.occupied_cells += s ? 1 : 0;
-            last_quality.coverage_ratio =
-                static_cast<double>(last_quality.occupied_cells) /
-                static_cast<double>(last_quality.grid_rows * last_quality.grid_cols);
-        }
-        last_quality.weak_texture =
-            last_quality.total_points < FRONTEND_MIN_QUALITY_POINTS ||
-            (last_quality.mean_track_eigen >= 0.0 &&
-             last_quality.mean_track_eigen < FRONTEND_QUALITY_MIN_EIGEN);
-        last_quality.poor_distribution =
-            last_quality.total_points >= FRONTEND_MIN_QUALITY_POINTS &&
-            last_quality.coverage_ratio < FRONTEND_MIN_COVERAGE_RATIO;
+
+        FrontendCoverageStats coverage_stats = computeCoverageStats(tracked_pts_before_new,
+                                                                    n_pts,
+                                                                    tracked_ids_before_new,
+                                                                    prev_pts_by_id_for_coverage,
+                                                                    col,
+                                                                    row,
+                                                                    FRONTEND_GRID_COLS,
+                                                                    FRONTEND_GRID_ROWS);
+        last_total_feature_count_ = static_cast<int>(cur_pts.size());
+        last_tracked_feature_count_ = tracked_count_before_new;
+        last_new_feature_count_ = new_count_added;
+        last_grid_coverage_ratio_ = coverage_stats.coverage_ratio;
+        writeFrontendCoverageSidecar(cur_time, coverage_stats, FRONTEND_GRID_FEATURE_ENABLE != 0);
+        ROS_INFO_STREAM_THROTTLE(1.0, "FRONTEND_COVERAGE total=" << last_total_feature_count_
+                                 << " tracked=" << last_tracked_feature_count_
+                                 << " new=" << last_new_feature_count_
+                                 << " coverage=" << std::fixed << std::setprecision(3)
+                                 << last_grid_coverage_ratio_);
         //printf("feature cnt after add %d\n", (int)ids.size());
     }
 
@@ -602,7 +552,7 @@ map<int, vector<pair<int, FeatureObservation>>> FeatureTracker::trackImage(doubl
     for(size_t i = 0; i < cur_pts.size(); i++)
         prevLeftPtsMap[ids[i]] = cur_pts[i];
 
-    map<int, vector<pair<int, FeatureObservation>>> featureFrame;
+    map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> featureFrame;
     for (size_t i = 0; i < ids.size(); i++)
     {
         int feature_id = ids[i];
@@ -618,9 +568,8 @@ map<int, vector<pair<int, FeatureObservation>>> FeatureTracker::trackImage(doubl
         velocity_x = pts_velocity[i].x;
         velocity_y = pts_velocity[i].y;
 
-        FeatureObservation xyz_uv_velocity;
-        const double quality = 1.0;
-        xyz_uv_velocity << x, y, z, p_u, p_v, velocity_x, velocity_y, quality;
+        Eigen::Matrix<double, 7, 1> xyz_uv_velocity;
+        xyz_uv_velocity << x, y, z, p_u, p_v, velocity_x, velocity_y;
         featureFrame[feature_id].emplace_back(camera_id,  xyz_uv_velocity);
     }
 
@@ -641,25 +590,14 @@ map<int, vector<pair<int, FeatureObservation>>> FeatureTracker::trackImage(doubl
             velocity_x = right_pts_velocity[i].x;
             velocity_y = right_pts_velocity[i].y;
 
-            FeatureObservation xyz_uv_velocity;
-            const double quality = 1.0;
-            xyz_uv_velocity << x, y, z, p_u, p_v, velocity_x, velocity_y, quality;
+            Eigen::Matrix<double, 7, 1> xyz_uv_velocity;
+            xyz_uv_velocity << x, y, z, p_u, p_v, velocity_x, velocity_y;
             featureFrame[feature_id].emplace_back(camera_id,  xyz_uv_velocity);
         }
     }
 
-    // ===== FEATURE LOGGING (added) =====
-    // 此处 cur_pts / ids / track_cnt 已是最终送进后端的左相机点 (一一对齐).
-    logFeatureStats(cur_time, cur_pts, ids, track_cnt, row, col);
-    // ===================================
-
     //printf("feature track whole time %f\n", t_r.toc());
     return featureFrame;
-}
-
-const FrontendQuality &FeatureTracker::getLastFrontendQuality() const
-{
-    return last_quality;
 }
 
 void FeatureTracker::rejectWithF()
@@ -813,8 +751,36 @@ void FeatureTracker::drawTrack(const cv::Mat &imLeft, const cv::Mat &imRight,
 
     for (size_t j = 0; j < curLeftPts.size(); j++)
     {
-        double len = std::min(1.0, 1.0 * track_cnt[j] / 20);
-        cv::circle(imTrack, curLeftPts[j], 2, cv::Scalar(255 * (1 - len), 0, 255 * len), 2);
+        const bool is_new_point = j < track_cnt.size() && track_cnt[j] <= 1;
+        const cv::Scalar color = is_new_point ? cv::Scalar(0, 255, 255) : cv::Scalar(0, 165, 255);
+        cv::circle(imTrack, curLeftPts[j], 2, color, 2);
+    }
+
+    std::ostringstream overlay;
+    overlay << "total=" << last_total_feature_count_
+            << " tracked=" << last_tracked_feature_count_
+            << " new=" << last_new_feature_count_
+            << " cover=" << std::fixed << std::setprecision(2) << last_grid_coverage_ratio_;
+    cv::rectangle(imTrack, cv::Point(5, 5), cv::Point(365, 34), cv::Scalar(0, 0, 0), -1);
+    cv::putText(imTrack, overlay.str(), cv::Point(12, 26), cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+    cv::putText(imTrack, "tracked=orange new=yellow", cv::Point(12, 52), cv::FONT_HERSHEY_SIMPLEX, 0.45,
+                cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+
+    // Read-only low-texture warning. We do NOT fabricate points to fill the
+    // frame here; we only flag that the scene is texture-poor so the run log /
+    // debug image make it visible when the estimator should be leaning on the
+    // IMU. Whether to act on this downstream is decided after reviewing bags.
+    if (FRONTEND_LOW_TEX_COVERAGE > 0.0 &&
+        last_grid_coverage_ratio_ < FRONTEND_LOW_TEX_COVERAGE)
+    {
+        cv::rectangle(imTrack, cv::Point(5, 60), cv::Point(365, 88), cv::Scalar(0, 0, 128), -1);
+        cv::putText(imTrack, "LOW-TEX: trust IMU", cv::Point(12, 82), cv::FONT_HERSHEY_SIMPLEX, 0.6,
+                    cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
+        ROS_WARN_STREAM_THROTTLE(1.0, "FRONTEND_LOW_TEX coverage=" << std::fixed
+                                 << std::setprecision(3) << last_grid_coverage_ratio_
+                                 << " < " << FRONTEND_LOW_TEX_COVERAGE
+                                 << " total=" << last_total_feature_count_);
     }
     if (!imRight.empty() && stereo_cam)
     {
@@ -858,41 +824,21 @@ void FeatureTracker::setPrediction(map<int, Eigen::Vector3d> &predictPts)
     hasPrediction = true;
     predict_pts.clear();
     predict_pts_debug.clear();
-
-    std::vector<cv::Point2f> tmp(prev_pts.size());
-    std::vector<char> has(prev_pts.size(), 0);
-    std::vector<float> dxs, dys;
-
-    for (size_t i = 0; i < ids.size() && i < prev_pts.size(); i++)
+    map<int, Eigen::Vector3d>::iterator itPredict;
+    for (size_t i = 0; i < ids.size(); i++)
     {
-        auto it = predictPts.find(ids[i]);
-        if (it != predictPts.end())
+        //printf("prevLeftId size %d prevLeftPts size %d\n",(int)prevLeftIds.size(), (int)prevLeftPts.size());
+        int id = ids[i];
+        itPredict = predictPts.find(id);
+        if (itPredict != predictPts.end())
         {
-            Eigen::Vector2d uv;
-            m_camera[0]->spaceToPlane(it->second, uv);
-            tmp[i] = cv::Point2f(static_cast<float>(uv.x()), static_cast<float>(uv.y()));
-            has[i] = 1;
-            dxs.push_back(tmp[i].x - prev_pts[i].x);
-            dys.push_back(tmp[i].y - prev_pts[i].y);
+            Eigen::Vector2d tmp_uv;
+            m_camera[0]->spaceToPlane(itPredict->second, tmp_uv);
+            predict_pts.push_back(cv::Point2f(tmp_uv.x(), tmp_uv.y()));
+            predict_pts_debug.push_back(cv::Point2f(tmp_uv.x(), tmp_uv.y()));
         }
-    }
-
-    float mdx = 0.f, mdy = 0.f;
-    if (!dxs.empty())
-    {
-        size_t m = dxs.size() / 2;
-        std::nth_element(dxs.begin(), dxs.begin() + m, dxs.end());
-        mdx = dxs[m];
-        std::nth_element(dys.begin(), dys.begin() + m, dys.end());
-        mdy = dys[m];
-    }
-
-    for (size_t i = 0; i < prev_pts.size(); i++)
-    {
-        cv::Point2f p = has[i] ? tmp[i]
-                               : cv::Point2f(prev_pts[i].x + mdx, prev_pts[i].y + mdy);
-        predict_pts.push_back(p);
-        predict_pts_debug.push_back(p);
+        else
+            predict_pts.push_back(prev_pts[i]);
     }
 }
 

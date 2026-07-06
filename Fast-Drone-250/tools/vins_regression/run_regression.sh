@@ -11,7 +11,7 @@ BAG_RATE="${BAG_RATE:-3.0}"
 mkdir -p "$OUT"
 SUMMARY="$OUT/summary.csv"
 METADATA="$OUT/metadata.txt"
-echo "bag,expect_init,init_success,pass,odom_count,imu_count,first_stamp,last_stamp,duration,end_norm,max_rel,max_step,max_speed,imu_first_cov0,imu_last_cov0,init_finish_count,gate_accept_count,sanity_reject_count,failure_count,run_dir" > "$SUMMARY"
+echo "bag,expect_init,init_success,pass,odom_count,imu_count,first_stamp,last_stamp,duration,first_x,first_y,first_z,last_x,last_y,last_z,end_norm,max_rel,max_step,max_speed,imu_first_cov0,imu_last_cov0,init_finish_count,gate_accept_count,sanity_reject_count,failure_count,run_dir" > "$SUMMARY"
 
 write_metadata() {
     local config="$ROOT/VINS-Fusion/config/fast_drone_250.yaml"
@@ -58,7 +58,7 @@ run_one() {
     stem="$(basename "$bag" .bag)"
     local run_dir="$OUT/${stem}_run${run_idx}"
     mkdir -p "$run_dir/ros_home" "$run_dir/ros_log" "$run_dir/records"
-    rm -f /tmp/vins_output/backend_selector_stats.csv
+    rm -f /tmp/vins_output/backend_selector_stats.csv /tmp/vins_output/vins_state_log.csv /tmp/vins_output/frontend_coverage_stats.csv /tmp/vins_output/backend_feature_fate.csv /tmp/vins_output/backend_feature_observability.csv
 
     source /opt/ros/noetic/setup.bash
     source "$ROOT/devel/setup.bash"
@@ -68,7 +68,10 @@ run_one() {
     export ROS_HOSTNAME="127.0.0.1"
     export ROS_HOME="$run_dir/ros_home"
     export ROS_LOG_DIR="$run_dir/ros_log"
-    export LD_LIBRARY_PATH="$ROOT/devel/lib:${LD_LIBRARY_PATH:-}"
+    # Pin runtime lookup to this workspace first. The machine has other ROS/catkin
+    # overlays (for example /home/jun/catkin_ws) that may inject a different
+    # libvins_lib.so into LD_LIBRARY_PATH and make regression runs non-reproducible.
+    export LD_LIBRARY_PATH="$ROOT/devel/lib:$ROOT/build/vins_estimator:${LD_LIBRARY_PATH:-}"
 
     local core_pid="" launch_pid="" rec_pid="" play_pid=""
     cleanup_run() {
@@ -115,6 +118,18 @@ run_one() {
     rostopic list > "$run_dir/topics_after.txt" || true
     if [[ -f /tmp/vins_output/backend_selector_stats.csv ]]; then
         cp /tmp/vins_output/backend_selector_stats.csv "$run_dir/backend_selector_stats.csv"
+    fi
+    if [[ -f /tmp/vins_output/vins_state_log.csv ]]; then
+        cp /tmp/vins_output/vins_state_log.csv "$run_dir/vins_state_log.csv"
+    fi
+    if [[ -f /tmp/vins_output/frontend_coverage_stats.csv ]]; then
+        cp /tmp/vins_output/frontend_coverage_stats.csv "$run_dir/frontend_coverage_stats.csv"
+    fi
+    if [[ -f /tmp/vins_output/backend_feature_fate.csv ]]; then
+        cp /tmp/vins_output/backend_feature_fate.csv "$run_dir/backend_feature_fate.csv"
+    fi
+    if [[ -f /tmp/vins_output/backend_feature_observability.csv ]]; then
+        cp /tmp/vins_output/backend_feature_observability.csv "$run_dir/backend_feature_observability.csv"
     fi
     /usr/bin/python3 "$ROOT/tools/vins_regression/summarize_run.py" "$run_dir" "$bag" "$expect_init" >> "$SUMMARY"
 }

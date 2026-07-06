@@ -33,45 +33,13 @@ bool inBorder(const cv::Point2f &pt);
 void reduceVector(vector<cv::Point2f> &v, vector<uchar> status);
 void reduceVector(vector<int> &v, vector<uchar> status);
 
-struct FrontendQuality
-{
-    FrontendQuality();
-
-    int prev_points;
-    int tracked_after_lk;
-    int tracked_after_ransac;
-    int new_points;
-    int total_points;
-    int occupied_cells;
-    int grid_cols;
-    int grid_rows;
-    double lk_keep_ratio;
-    double mean_lk_error;
-    double mean_fb_error;
-    double mean_track_eigen;
-    double mean_pixel_flow;
-    double coverage_ratio;
-    double brightness_mean;
-    double dark_ratio;
-    double saturated_ratio;
-    double contrast_std;
-    double blur_score;
-    double photometric_health;
-    bool low_tracking_quality;
-    bool weak_texture;
-    bool poor_distribution;
-    bool ransac_rejected;
-    bool low_parallax;
-};
-
 class FeatureTracker
 {
 public:
     FeatureTracker();
-    map<int, vector<pair<int, FeatureObservation>>> trackImage(double _cur_time, const cv::Mat &_img, const cv::Mat &_img1 = cv::Mat());
-    const FrontendQuality &getLastFrontendQuality() const;
-    void setRelativeRotation(const Eigen::Matrix3d &R_cur_prev_cam);
+    map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> trackImage(double _cur_time, const cv::Mat &_img, const cv::Mat &_img1 = cv::Mat());
     void setMask();
+    void extractGridFeatures();
     void readIntrinsicParameter(const vector<string> &calib_file);
     void showUndistortion(const string &name);
     void rejectWithF();
@@ -87,9 +55,6 @@ public:
                                    vector<cv::Point2f> &curRightPts,
                                    map<int, cv::Point2f> &prevLeftPtsMap);
     void setPrediction(map<int, Eigen::Vector3d> &predictPts);
-    void addAdaptiveCorners(int need_cnt);
-    void addGradientFeatures(int need_cnt);
-
     double distance(cv::Point2f &pt1, cv::Point2f &pt2);
     void removeOutliers(set<int> &removePtsIds);
     cv::Mat getTrackImage();
@@ -101,6 +66,13 @@ public:
     cv::Mat fisheye_mask;
     cv::Mat prev_img, cur_img;
     vector<cv::Point2f> n_pts;
+    vector<cv::Point2f> cell_pts_;
+    vector<int> grid_cnt_;
+    cv::Mat min_eig_map_;
+    int last_total_feature_count_;
+    int last_tracked_feature_count_;
+    int last_new_feature_count_;
+    double last_grid_coverage_ratio_;
     vector<cv::Point2f> predict_pts;
     vector<cv::Point2f> predict_pts_debug;
     vector<cv::Point2f> prev_pts, cur_pts, cur_right_pts;
@@ -117,6 +89,4 @@ public:
     bool stereo_cam;
     int n_id;
     bool hasPrediction;
-    Eigen::Matrix3d relative_rotation_;
-    FrontendQuality last_quality;
 };

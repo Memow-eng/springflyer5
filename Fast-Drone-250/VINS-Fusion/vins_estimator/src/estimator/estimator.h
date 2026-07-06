@@ -11,20 +11,17 @@
  
 #include <thread>
 #include <mutex>
-#include <deque>
 #include <std_msgs/Header.h>
 #include <std_msgs/Float32.h>
 #include <ceres/ceres.h>
 #include <unordered_map>
 #include <queue>
-#include <array>
 #include <opencv2/core/eigen.hpp>
 #include <eigen3/Eigen/Dense>
 #include <eigen3/Eigen/Geometry>
 
 #include "parameters.h"
 #include "feature_manager.h"
-#include "visual_health_monitor.h"
 #include "../utility/utility.h"
 #include "../utility/tic_toc.h"
 #include "../initial/solve_5pts.h"
@@ -34,30 +31,11 @@
 #include "../factor/imu_factor.h"
 #include "../factor/pose_local_parameterization.h"
 #include "../factor/marginalization_factor.h"
-#include "../factor/blind_inertial_factor.h"
 #include "../factor/projectionTwoFrameOneCamFactor.h"
 #include "../factor/projectionTwoFrameTwoCamFactor.h"
 #include "../factor/projectionOneFrameTwoCamFactor.h"
 #include "../featureTracker/feature_tracker.h"
 
-struct FeatureMeasurement
-{
-    FeatureMeasurement()
-        : t(0.0)
-    {
-    }
-
-    FeatureMeasurement(double _t,
-                       const map<int, vector<pair<int, FeatureObservation>>> &_features,
-                       const FrontendQuality &_quality)
-        : t(_t), features(_features), quality(_quality)
-    {
-    }
-
-    double t;
-    map<int, vector<pair<int, FeatureObservation>>> features;
-    FrontendQuality quality;
-};
 
 class Estimator
 {
@@ -69,14 +47,10 @@ class Estimator
     // interface
     void initFirstPose(Eigen::Vector3d p, Eigen::Matrix3d r);
     void inputIMU(double t, const Vector3d &linearAcceleration, const Vector3d &angularVelocity);
-    void inputThrust(double t, double thrust_norm);
-    double getThrustAcc(double t);
-    void inputFeature(double t, const map<int, vector<pair<int, FeatureObservation>>> &featureFrame);
+    void inputFeature(double t, const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &featureFrame);
     void inputImage(double t, const cv::Mat &_img, const cv::Mat &_img1 = cv::Mat());
     void processIMU(double t, double dt, const Vector3d &linear_acceleration, const Vector3d &angular_velocity);
-    void processImage(const map<int, vector<pair<int, FeatureObservation>>> &image,
-                      const double header,
-                      const FrontendQuality &frontend_quality);
+    void processImage(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, const double header);
     void processMeasurements();
     void changeSensorType(int use_imu, int use_stereo);
 
@@ -85,12 +59,6 @@ class Estimator
     bool initialStructure();
     bool visualInitialAlign();
     bool relativePose(Matrix3d &relative_R, Vector3d &relative_T, int &l);
-    bool isStereoInitializationReady(double header) const;
-    bool isStereoInitializationSane(double header) const;
-    void logStereoInitializationGateStats(double header, const char *tag) const;
-    void logStereoInitializationQuality(double header) const;
-    void resetInitializationCandidate(double header);
-    void slideInitializationCandidate(double header);
     void slideWindow();
     void slideWindowNew();
     void slideWindowOld();
@@ -104,47 +72,13 @@ class Estimator
     void getPoseInWorldFrame(int index, Eigen::Matrix4d &T);
     void predictPtsInNextFrame();
     void outliersRejection(set<int> &removeIndex);
-    double reprojectionError(const Matrix3d &Ri, const Vector3d &Pi, const Matrix3d &rici, const Vector3d &tici,
-                                     const Matrix3d &Rj, const Vector3d &Pj, const Matrix3d &ricj, const Vector3d &ticj, 
-                                     double depth, const Vector3d &uvi, const Vector3d &uvj) const;
+    double reprojectionError(Matrix3d &Ri, Vector3d &Pi, Matrix3d &rici, Vector3d &tici,
+                                     Matrix3d &Rj, Vector3d &Pj, Matrix3d &ricj, Vector3d &ticj, 
+                                     double depth, Vector3d &uvi, Vector3d &uvj);
     void updateLatestStates();
     void fastPredictIMU(double t, Eigen::Vector3d linear_acceleration, Eigen::Vector3d angular_velocity);
     bool IMUAvailable(double t);
     void initFirstIMUPose(vector<pair<double, Eigen::Vector3d>> &accVector);
-    void updateVisualHealth(const map<int, vector<pair<int, FeatureObservation>>> &image,
-                            const FrontendQuality &frontend_quality,
-                            double header);
-    bool shouldSkipVisualFrame(const map<int, vector<pair<int, FeatureObservation>>> &image,
-                               const FrontendQuality &frontend_quality) const;
-    void enterBlind(double header);
-    void exitBlind(double header);
-    void addNominalBiasPrior(ceres::Problem &problem, ceres::LossFunction *loss_function);
-    void addBlindFactors(ceres::Problem &problem, ceres::LossFunction *loss_function);
-    void logDynamicsResiduals();
-    bool clampBlindBiases();
-    bool isBlind() const;
-    bool isVisualDegraded() const;
-    bool isLowFlowStationary() const;
-    void applyLowFlowStationaryLock();
-    bool allowImuPropagateOutput() const;
-    int getFrontendPointCount() const;
-    double getFrontendCoverageRatio() const;
-    double getFrontendKeepRatio() const;
-    double getLatestEstimatorLatency() const;
-    int getHealthCode() const;
-    bool isLowDynamic(int frame_index) const;
-    bool isGroundStatic(int frame_index) const;
-    double blindDuration(double header) const;
-    std::vector<char> selectGoodFeatures() const;
-    std::array<double, 4> computeFeatureQualityMetrics() const;
-    double computeFeatureQualityScore(const FeaturePerId &feature) const;
-    double estimateFeatureParallaxPx(const FeaturePerId &feature) const;
-    double estimateFeatureReprojectionErrorPx(const FeaturePerId &feature) const;
-    double estimateStereoDepthConsistency(const FeaturePerId &feature) const;
-    double getFeatureQualityMedian() const;
-    double getFeatureQualityBadRatio() const;
-    double getFeatureHighQualityLongRatio() const;
-    double getFeatureNewRatio() const;
 
     enum SolverFlag
     {
@@ -161,10 +95,9 @@ class Estimator
     std::mutex mProcess;
     std::mutex mBuf;
     std::mutex mPropagate;
-    std::mutex mTracker;
     queue<pair<double, Eigen::Vector3d>> accBuf;
     queue<pair<double, Eigen::Vector3d>> gyrBuf;
-    queue<FeatureMeasurement> featureBuf;
+    queue<pair<double, map<int, vector<pair<int, Eigen::Matrix<double, 7, 1> > > > > > featureBuf;
     double prevTime, curTime;
     bool openExEstimation;
 
@@ -241,36 +174,4 @@ class Estimator
 
     bool initFirstPoseFlag;
     bool initThreadFlag;
-
-    VisualState visual_state;
-    VisualState pending_state_;
-    int pending_count_;
-    int visual_track_num;
-    double visual_parallax;
-    double blind_start_time;
-    bool blind_active;
-    bool blind_anchor_valid;
-    bool low_flow_lock_active_;
-    bool home_loop_origin_valid_;
-    bool home_loop_active_;
-    bool last_state_valid_;
-    int soft_failure_count_ = 0;
-    int bias_failure_count_ = 0;
-    int little_feature_count_ = 0;
-    int nonlinear_frame_count_ = 0;
-    int stereo_init_ready_reject_count_ = 0;
-    int home_loop_static_count_;
-    double home_loop_max_radius_;
-    double nonlinear_start_time_;
-    Eigen::Vector3d blind_ba0;
-    Eigen::Vector3d blind_bg0;
-    Eigen::Vector3d blind_acc_body0;
-    Eigen::Vector3d blind_v0;
-    Eigen::Vector3d low_flow_lock_P_;
-    Eigen::Vector3d home_loop_origin_;
-    FrontendQuality latest_frontend_quality_;
-    double latest_estimator_latency_ms_;
-    std::array<double, 4> latest_feature_quality_metrics_;
-    std::mutex mThrust;
-    std::deque<std::pair<double, double>> thrustBuf;
 };

@@ -9,7 +9,6 @@
 
 #include "estimator.h"
 #include "../utility/visualization.h"
-#include "../factor/zero_velocity_factor.h"
 #include <algorithm>
 #include <fstream>
 #include <iomanip>
@@ -346,6 +345,305 @@ static void writeSelectorStat(const SelectorFrameStat &stat)
         << stat.solver_time_ms << ','
         << stat.ceres_iterations << ','
         << std::setprecision(9) << stat.final_cost << '\n';
+}
+
+static void writeZDriftState(double timestamp,
+                             Estimator::SolverFlag solver_flag,
+                             int frame_count,
+                             const Eigen::Vector3d &P,
+                             const Eigen::Vector3d &V,
+                             const Eigen::Vector3d &Ba,
+                             const Eigen::Vector3d &Bg,
+                             const Eigen::Vector3d &g)
+{
+    if (!Z_DRIFT_STATE_LOG_ENABLE || OUTPUT_FOLDER.empty())
+        return;
+
+    const std::string path = OUTPUT_FOLDER + "/vins_state_log.csv";
+    static bool header_written = false;
+    std::ofstream out(path.c_str(), std::ios::app);
+    if (!out.is_open())
+        return;
+    if (!header_written)
+    {
+        out << "time,solver_flag,frame_count,"
+               "px,py,pz,vx,vy,vz,bax,bay,baz,bgx,bgy,bgz,gx,gy,gz,ba_norm,bg_norm,g_norm\n";
+        header_written = true;
+    }
+
+    out << std::fixed
+        << std::setprecision(9) << timestamp << ','
+        << (solver_flag == Estimator::NON_LINEAR ? "NON_LINEAR" : "INITIAL") << ','
+        << frame_count << ','
+        << std::setprecision(6)
+        << P.x() << ',' << P.y() << ',' << P.z() << ','
+        << V.x() << ',' << V.y() << ',' << V.z() << ','
+        << Ba.x() << ',' << Ba.y() << ',' << Ba.z() << ','
+        << Bg.x() << ',' << Bg.y() << ',' << Bg.z() << ','
+        << g.x() << ',' << g.y() << ',' << g.z() << ','
+        << Ba.norm() << ',' << Bg.norm() << ',' << g.norm() << '\n';
+}
+
+static void writeBackendFeatureFateSidecar(int frame_count,
+                                           int feature_id,
+                                           int used_num,
+                                           double estimated_depth,
+                                           double avg_reproj_px,
+                                           int rejected)
+{
+    if (!BACKEND_FEATURE_FATE_SIDECAR_LOG_ENABLE || OUTPUT_FOLDER.empty())
+        return;
+
+    const std::string path = OUTPUT_FOLDER + "/backend_feature_fate.csv";
+    static bool header_written = false;
+    std::ofstream out(path.c_str(), std::ios::app);
+    if (!out.is_open())
+        return;
+
+    if (!header_written)
+    {
+        out << "frame_count,feature_id,used_num,estimated_depth,avg_reproj_px,rejected\n";
+        header_written = true;
+    }
+
+    out << frame_count << ','
+        << feature_id << ','
+        << used_num << ','
+        << std::fixed << std::setprecision(9)
+        << estimated_depth << ','
+        << avg_reproj_px << ','
+        << rejected << '\n';
+}
+
+static int obsUseReasonCode(ObsUseReason reason)
+{
+    return static_cast<int>(reason);
+}
+
+static const char *obsUseReasonName(ObsUseReason reason)
+{
+    switch (reason)
+    {
+    case ObsUseReason::STRUCTURAL_ANCHOR:
+        return "structural_anchor";
+    case ObsUseReason::MARGINALIZATION_PIN:
+        return "marginalization_pin";
+    case ObsUseReason::BUDGET_SELECTED:
+        return "budget_selected";
+    case ObsUseReason::UNCOMPRESSED_KEEP:
+        return "uncompressed_keep";
+    case ObsUseReason::REJECTED:
+    default:
+        return "rejected";
+    }
+}
+
+static void writeBackendFeatureObservabilityRow(std::ofstream &out,
+                                                int backend_frame_seq,
+                                                int frame_count,
+                                                int feature_id,
+                                                int start_frame,
+                                                int end_frame,
+                                                int used_num,
+                                                double estimated_depth,
+                                                int solve_flag,
+                                                bool selector_initialized,
+                                                bool compression_frame_enabled,
+                                                bool marg_locked,
+                                                int selected_obs,
+                                                int cut_obs,
+                                                int stereo_obs,
+                                                int temporal_obs,
+                                                double max_anchor_parallax_norm,
+                                                double mean_anchor_parallax_norm,
+                                                double max_anchor_parallax_px,
+                                                double mean_anchor_parallax_px,
+                                                double first_last_parallax_px,
+                                                double mean_stereo_disparity_px,
+                                                int structural_anchor_obs,
+                                                int marg_pin_obs,
+                                                int budget_selected_obs,
+                                                int uncompressed_keep_obs,
+                                                int rejected_obs,
+                                                int first_reason,
+                                                int last_reason)
+{
+    out << backend_frame_seq << ','
+        << frame_count << ','
+        << feature_id << ','
+        << start_frame << ','
+        << end_frame << ','
+        << used_num << ','
+        << std::fixed << std::setprecision(9)
+        << estimated_depth << ','
+        << solve_flag << ','
+        << selector_initialized << ','
+        << compression_frame_enabled << ','
+        << marg_locked << ','
+        << selected_obs << ','
+        << cut_obs << ','
+        << stereo_obs << ','
+        << temporal_obs << ','
+        << max_anchor_parallax_norm << ','
+        << mean_anchor_parallax_norm << ','
+        << max_anchor_parallax_px << ','
+        << mean_anchor_parallax_px << ','
+        << first_last_parallax_px << ','
+        << mean_stereo_disparity_px << ','
+        << structural_anchor_obs << ','
+        << marg_pin_obs << ','
+        << budget_selected_obs << ','
+        << uncompressed_keep_obs << ','
+        << rejected_obs << ','
+        << first_reason << ','
+        << last_reason << ','
+        << obsUseReasonName(static_cast<ObsUseReason>(first_reason)) << ','
+        << obsUseReasonName(static_cast<ObsUseReason>(last_reason)) << '\n';
+}
+
+static void writeBackendFeatureObservabilityFrame(const FeatureManager &f_manager,
+                                                  int backend_frame_seq,
+                                                  int frame_count,
+                                                  const FrameDecision &decision,
+                                                  const SelectorFrameStat &stat)
+{
+    if (!BACKEND_FEATURE_OBSERVABILITY_SIDECAR_LOG_ENABLE || OUTPUT_FOLDER.empty())
+        return;
+
+    // Keep diagnostic logging bounded: one batch write per optimization frame.
+    // This avoids per-feature open/write/close stalls in the VIO hot path.
+    const std::string path = OUTPUT_FOLDER + "/backend_feature_observability.csv";
+    static bool header_written = false;
+    std::ofstream out(path.c_str(), std::ios::app);
+    if (!out.is_open())
+        return;
+    if (!header_written)
+    {
+        out << "backend_frame_seq,frame_count,feature_id,start_frame,end_frame,used_num,estimated_depth,solve_flag,"
+               "selector_initialized,compression_frame_enabled,marg_locked,selected_obs,cut_obs,"
+               "stereo_obs,temporal_obs,max_anchor_parallax_norm,mean_anchor_parallax_norm,"
+               "max_anchor_parallax_px,mean_anchor_parallax_px,first_last_parallax_px,mean_stereo_disparity_px,"
+               "structural_anchor_obs,marg_pin_obs,budget_selected_obs,uncompressed_keep_obs,rejected_obs,"
+               "first_reason,last_reason,first_reason_name,last_reason_name\n";
+        header_written = true;
+    }
+
+    for (const auto &lm : f_manager.feature)
+    {
+        const int used_num = static_cast<int>(lm.feature_per_frame.size());
+        if (!(used_num >= 4 && lm.start_frame < WINDOW_SIZE - 2))
+            continue;
+
+        const FeatureDecision *fd = decision.findFeature(lm.feature_id);
+        int selected_obs = 0;
+        int structural_anchor_obs = 0;
+        int marg_pin_obs = 0;
+        int budget_selected_obs = 0;
+        int uncompressed_keep_obs = 0;
+        int rejected_obs = 0;
+        int first_reason = obsUseReasonCode(ObsUseReason::REJECTED);
+        int last_reason = obsUseReasonCode(ObsUseReason::REJECTED);
+
+        if (fd != nullptr)
+        {
+            for (int i = 0; i < static_cast<int>(fd->obs.size()); ++i)
+            {
+                const ObsDecision &obs = fd->obs[i];
+                if (obs.use)
+                    selected_obs++;
+                switch (obs.reason)
+                {
+                case ObsUseReason::STRUCTURAL_ANCHOR:
+                    structural_anchor_obs++;
+                    break;
+                case ObsUseReason::MARGINALIZATION_PIN:
+                    marg_pin_obs++;
+                    break;
+                case ObsUseReason::BUDGET_SELECTED:
+                    budget_selected_obs++;
+                    break;
+                case ObsUseReason::UNCOMPRESSED_KEEP:
+                    uncompressed_keep_obs++;
+                    break;
+                case ObsUseReason::REJECTED:
+                default:
+                    rejected_obs++;
+                    break;
+                }
+            }
+            if (!fd->obs.empty())
+            {
+                first_reason = obsUseReasonCode(fd->obs.front().reason);
+                last_reason = obsUseReasonCode(fd->obs.back().reason);
+            }
+        }
+        else
+        {
+            rejected_obs = used_num;
+        }
+
+        const Eigen::Vector3d anchor = lm.feature_per_frame.front().point;
+        double max_anchor_parallax_norm = 0.0;
+        double sum_anchor_parallax_norm = 0.0;
+        double stereo_disparity_px_sum = 0.0;
+        int stereo_obs = 0;
+        int temporal_obs = 0;
+
+        for (int i = 0; i < used_num; ++i)
+        {
+            const FeaturePerFrame &obs = lm.feature_per_frame[i];
+            const double anchor_parallax_norm = (obs.point - anchor).head<2>().norm();
+            max_anchor_parallax_norm = std::max(max_anchor_parallax_norm, anchor_parallax_norm);
+            if (i > 0)
+            {
+                sum_anchor_parallax_norm += anchor_parallax_norm;
+                temporal_obs++;
+            }
+            if (obs.is_stereo)
+            {
+                stereo_obs++;
+                stereo_disparity_px_sum += (obs.pointRight - obs.point).head<2>().norm() * FOCAL_LENGTH;
+            }
+        }
+
+        const double mean_anchor_parallax_norm =
+            temporal_obs > 0 ? sum_anchor_parallax_norm / temporal_obs : 0.0;
+        const double first_last_parallax_px =
+            (lm.feature_per_frame.back().point - anchor).head<2>().norm() * FOCAL_LENGTH;
+        const double mean_stereo_disparity_px =
+            stereo_obs > 0 ? stereo_disparity_px_sum / stereo_obs : 0.0;
+        const int cut_obs = std::max(0, used_num - selected_obs);
+
+        writeBackendFeatureObservabilityRow(out,
+                                            backend_frame_seq,
+                                            frame_count,
+                                            lm.feature_id,
+                                            lm.start_frame,
+                                            lm.endFrame(),
+                                            used_num,
+                                            lm.estimated_depth,
+                                            lm.solve_flag,
+                                            stat.initialized,
+                                            stat.compression_frame_enabled,
+                                            fd != nullptr && fd->marg_locked,
+                                            selected_obs,
+                                            cut_obs,
+                                            stereo_obs,
+                                            temporal_obs,
+                                            max_anchor_parallax_norm,
+                                            mean_anchor_parallax_norm,
+                                            max_anchor_parallax_norm * FOCAL_LENGTH,
+                                            mean_anchor_parallax_norm * FOCAL_LENGTH,
+                                            first_last_parallax_px,
+                                            mean_stereo_disparity_px,
+                                            structural_anchor_obs,
+                                            marg_pin_obs,
+                                            budget_selected_obs,
+                                            uncompressed_keep_obs,
+                                            rejected_obs,
+                                            first_reason,
+                                            last_reason);
+    }
 }
 
 } // namespace
@@ -883,6 +1181,8 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
         optimization();
         set<int> removeIndex;
         outliersRejection(removeIndex);
+        writeZDriftState(header, solver_flag, frame_count,
+                         Ps[frame_count], Vs[frame_count], Bas[frame_count], Bgs[frame_count], g);
         f_manager.removeOutlier(removeIndex);
         if (! MULTIPLE_THREAD)
         {
@@ -1360,11 +1660,14 @@ void Estimator::optimization()
     if (solver_flag == NON_LINEAR)
         nonlinear_optimization_age++;
     FrameDecision selector_decision;
+    static int backend_observability_frame_seq = 0;
+    const int backend_frame_seq = backend_observability_frame_seq++;
     if (selector_stat.shadow_enabled)
     {
         TicToc t_selector;
         selector_decision = decideBackendSelector(f_manager, frame_count, marginalization_flag, &selector_stat);
         selector_stat.selector_time_ms = t_selector.toc();
+        writeBackendFeatureObservabilityFrame(f_manager, backend_frame_seq, frame_count, selector_decision, selector_stat);
     }
 
     ceres::Problem problem;
@@ -1421,18 +1724,6 @@ void Estimator::optimization()
             problem.AddResidualBlock(imu_factor, NULL, para_Pose[i], para_SpeedBias[i], para_Pose[j], para_SpeedBias[j]);
         }
 
-        // ===================== 零速约束 (ZUPT) 测试 =====================
-        // 仅在滑窗已经填满 (frame_count == WINDOW_SIZE) 时给最新帧加 V=0 约束
-        // weight 越大约束越硬; 先用 100.0, 实测后再调
-        // !! 当前为强制每次都加, 用于验证因子本身工作; 后续应加 IMU 静止检测再启用
-        if (frame_count == WINDOW_SIZE)
-        {
-            const double zupt_weight = 100;
-            ZeroVelocityFactor *zupt_factor = new ZeroVelocityFactor(zupt_weight);
-            problem.AddResidualBlock(zupt_factor, NULL,
-                                     para_SpeedBias[frame_count]);
-        }
-        // ==============================================================
     }
 
     int f_m_cnt = 0;
@@ -1994,7 +2285,15 @@ void Estimator::outliersRejection(set<int> &removeIndex)
             }
         }
         double ave_err = err / errCnt;
-        if(ave_err * FOCAL_LENGTH > 3)
+        const double ave_err_px = ave_err * FOCAL_LENGTH;
+        const bool rejected = ave_err_px > 3;
+        writeBackendFeatureFateSidecar(frame_count,
+                                       it_per_id.feature_id,
+                                       it_per_id.used_num,
+                                       it_per_id.estimated_depth,
+                                       ave_err_px,
+                                       rejected ? 1 : 0);
+        if(rejected)
             removeIndex.insert(it_per_id.feature_id);
 
     }
@@ -2003,6 +2302,12 @@ void Estimator::outliersRejection(set<int> &removeIndex)
 void Estimator::fastPredictIMU(double t, Eigen::Vector3d linear_acceleration, Eigen::Vector3d angular_velocity)
 {
     double dt = t - latest_time;
+    if (dt <= 0.0)
+    {
+        latest_acc_0 = linear_acceleration;
+        latest_gyr_0 = angular_velocity;
+        return;
+    }
     latest_time = t;
     Eigen::Vector3d un_acc_0 = latest_Q * (latest_acc_0 - latest_Ba) - g;
     Eigen::Vector3d un_gyr = 0.5 * (latest_gyr_0 + angular_velocity) - latest_Bg;
