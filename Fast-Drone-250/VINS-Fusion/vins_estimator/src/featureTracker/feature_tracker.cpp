@@ -200,6 +200,61 @@ void writeFrontendCoverageSidecar(double timestamp,
         << stats.min_nonzero_cell_count << ','
         << stats.max_cell_count << '\n';
 }
+
+// Log-only record for one newly extracted feature point. This is a pure sidecar:
+// it never touches cur_pts/ids/track_cnt or the status vectors, so deleting this
+// block must leave the output trajectory bit-for-bit unchanged.
+struct NewPointQualityRow
+{
+    int feature_id = -1;
+    float x = 0.f;
+    float y = 0.f;
+    int grid_id = -1;
+    double min_eig = 0.0;
+    int in_low_tex_cell = 0;
+    int would_cull_by_floor = 0;
+};
+
+void writeNewPointQualitySidecar(double timestamp,
+                                  const std::vector<NewPointQualityRow> &rows,
+                                  double min_eig_floor,
+                                  double low_tex_coverage,
+                                  double coverage_ratio)
+{
+    if (OUTPUT_FOLDER.empty())
+        return;
+
+    const std::string path = OUTPUT_FOLDER + "/frontend_newpoint_quality.csv";
+    static bool header_written = false;
+    std::ofstream out(path.c_str(), std::ios::app);
+    if (!out.is_open())
+        return;
+
+    if (!header_written)
+    {
+        out << "timestamp,feature_id,x,y,grid_id,min_eig,min_eig_floor,"
+               "coverage_ratio,low_tex_coverage,frame_low_tex,in_low_tex_cell,would_cull_by_floor\n";
+        header_written = true;
+    }
+
+    const int frame_low_tex = (low_tex_coverage > 0.0 && coverage_ratio < low_tex_coverage) ? 1 : 0;
+    for (const auto &r : rows)
+    {
+        out << std::fixed << std::setprecision(9)
+            << timestamp << ','
+            << r.feature_id << ','
+            << r.x << ','
+            << r.y << ','
+            << r.grid_id << ','
+            << r.min_eig << ','
+            << min_eig_floor << ','
+            << coverage_ratio << ','
+            << low_tex_coverage << ','
+            << frame_low_tex << ','
+            << r.in_low_tex_cell << ','
+            << r.would_cull_by_floor << '\n';
+    }
+}
 } // namespace
 
 bool FeatureTracker::inBorder(const cv::Point2f &pt)
@@ -463,6 +518,11 @@ map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> FeatureTracker::trackIm
         const int tracked_count_before_new = static_cast<int>(cur_pts.size());
         const int new_count_added = static_cast<int>(n_pts.size());
 
+        // Capture the base feature_id BEFORE the push loop mutates n_id, so the
+        // log-only sidecar below can reconstruct each new point's real feature_id
+        // (new_id_base + i) and join against backend_feature_fate.csv later.
+        const int new_id_base = n_id;
+
         for (auto &p : n_pts)
         {
             cur_pts.push_back(p);
@@ -483,6 +543,38 @@ map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> FeatureTracker::trackIm
         last_new_feature_count_ = new_count_added;
         last_grid_coverage_ratio_ = coverage_stats.coverage_ratio;
         writeFrontendCoverageSidecar(cur_time, coverage_stats, FRONTEND_GRID_FEATURE_ENABLE != 0);
+
+        // Log-only: record each new point's Shi-Tomasi response and low-texture context.
+        // Pure sidecar guarded by FRONTEND_MIN_EIG_LOG_ENABLE; when off (default) this
+        // block is skipped entirely, so the trajectory stays bit-for-bit unchanged.
+        if (FRONTEND_MIN_EIG_LOG_ENABLE && !n_pts.empty() && !cur_img.empty())
+        {
+            cv::Mat eig_map;
+            cv::cornerMinEigenVal(cur_img, eig_map, 3, 3);
+            const int grid_cols = std::max(1, std::min(FRONTEND_GRID_COLS, std::max(1, col)));
+            const int grid_rows = std::max(1, std::min(FRONTEND_GRID_ROWS, std::max(1, row)));
+            std::vector<NewPointQualityRow> rows;
+            rows.reserve(n_pts.size());
+            for (size_t i = 0; i < n_pts.size(); ++i)
+            {
+                const cv::Point2f &p = n_pts[i];
+                NewPointQualityRow r;
+                r.feature_id = new_id_base + static_cast<int>(i);
+                r.x = p.x;
+                r.y = p.y;
+                r.grid_id = gridIdForPoint(p, col, row, grid_cols, grid_rows);
+                const int ix = std::min(std::max(cvRound(p.x), 0), eig_map.cols - 1);
+                const int iy = std::min(std::max(cvRound(p.y), 0), eig_map.rows - 1);
+                r.min_eig = static_cast<double>(eig_map.at<float>(iy, ix));
+                r.in_low_tex_cell = (FRONTEND_LOW_TEX_COVERAGE > 0.0 &&
+                                     coverage_stats.coverage_ratio < FRONTEND_LOW_TEX_COVERAGE) ? 1 : 0;
+                r.would_cull_by_floor = (FRONTEND_MIN_EIG > 0.0 && r.min_eig < FRONTEND_MIN_EIG) ? 1 : 0;
+                rows.push_back(r);
+            }
+            writeNewPointQualitySidecar(cur_time, rows, FRONTEND_MIN_EIG, FRONTEND_LOW_TEX_COVERAGE,
+                                        coverage_stats.coverage_ratio);
+        }
+
         ROS_INFO_STREAM_THROTTLE(1.0, "FRONTEND_COVERAGE total=" << last_total_feature_count_
                                  << " tracked=" << last_tracked_feature_count_
                                  << " new=" << last_new_feature_count_

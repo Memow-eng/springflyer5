@@ -59,10 +59,11 @@ int FRONTEND_GRID_ROWS = 8;
 int FRONTEND_GRID_MAX_PER_CELL = 2;
 double FRONTEND_GRID_QUALITY = 0.05;
 double FRONTEND_FB_THRESHOLD = 0.5;
-double FRONTEND_MIN_EIG = 0.0;
-double FRONTEND_LOW_TEX_COVERAGE = 0.35;
 int BACKEND_FEATURE_FATE_SIDECAR_LOG_ENABLE = 0;
 int BACKEND_FEATURE_OBSERVABILITY_SIDECAR_LOG_ENABLE = 0;
+int FRONTEND_MIN_EIG_LOG_ENABLE = 0;
+double FRONTEND_MIN_EIG = 0.0;
+double FRONTEND_LOW_TEX_COVERAGE = 0.0;
 
 
 template <typename T>
@@ -128,10 +129,11 @@ void readParameters(std::string config_file)
     readOptionalParam(fsSettings, "frontend_grid_max_per_cell", FRONTEND_GRID_MAX_PER_CELL);
     readOptionalParam(fsSettings, "frontend_grid_quality", FRONTEND_GRID_QUALITY);
     readOptionalParam(fsSettings, "frontend_fb_threshold", FRONTEND_FB_THRESHOLD);
-    readOptionalParam(fsSettings, "frontend_min_eig", FRONTEND_MIN_EIG);
-    readOptionalParam(fsSettings, "frontend_low_tex_coverage", FRONTEND_LOW_TEX_COVERAGE);
     readOptionalParam(fsSettings, "backend_feature_fate_sidecar_log_enable", BACKEND_FEATURE_FATE_SIDECAR_LOG_ENABLE);
     readOptionalParam(fsSettings, "backend_feature_observability_sidecar_log_enable", BACKEND_FEATURE_OBSERVABILITY_SIDECAR_LOG_ENABLE);
+    readOptionalParam(fsSettings, "frontend_min_eig_log_enable", FRONTEND_MIN_EIG_LOG_ENABLE);
+    readOptionalParam(fsSettings, "frontend_min_eig", FRONTEND_MIN_EIG);
+    readOptionalParam(fsSettings, "frontend_low_tex_coverage", FRONTEND_LOW_TEX_COVERAGE);
 
     MULTIPLE_THREAD = fsSettings["multiple_thread"];
 

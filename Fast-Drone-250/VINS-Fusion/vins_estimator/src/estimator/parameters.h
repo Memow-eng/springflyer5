@@ -77,10 +77,11 @@ extern int FRONTEND_GRID_ROWS;
 extern int FRONTEND_GRID_MAX_PER_CELL;
 extern double FRONTEND_GRID_QUALITY;
 extern double FRONTEND_FB_THRESHOLD;
-extern double FRONTEND_MIN_EIG;
-extern double FRONTEND_LOW_TEX_COVERAGE;
 extern int BACKEND_FEATURE_FATE_SIDECAR_LOG_ENABLE;
 extern int BACKEND_FEATURE_OBSERVABILITY_SIDECAR_LOG_ENABLE;
+extern int FRONTEND_MIN_EIG_LOG_ENABLE;
+extern double FRONTEND_MIN_EIG;
+extern double FRONTEND_LOW_TEX_COVERAGE;
 
 void readParameters(std::string config_file);
 

@@ -64,7 +64,7 @@ backend_selector_min_total_obs: 500
 backend_selector_min_track_len: 8
 z_drift_state_log_enable: 1
 # Frontend new-feature distribution. Existing tracked features are never removed by this block.
-frontend_grid_feature_enable: 1
+frontend_grid_feature_enable: 0
 frontend_grid_cols: 12
 frontend_grid_rows: 8
 frontend_grid_max_per_cell: 2
